@@ -1,7 +1,3 @@
-# =====================================================================
-# ملف البناء التلقائي الشامل لمشروع QuMatix APK
-# يقوم هذا الملف بإنشاء كافة ملفات Flutter وتجميعها في ملف APK تلقائياً
-# =====================================================================
 name: Build QuMatix APK
 
 on:
@@ -15,37 +11,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. سحب بيانات المستودع الحالي
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      # 2. تثبيت بيئة جافا 17 الضرورية لبناء تطبيقات أندرويد
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # 3. تثبيت بيئة Flutter المستقرة
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.24.5'
           channel: 'stable'
           cache: true
 
-      # 4. إنشاء هيكل مشروع أندرويد الأساسي إذا لم يكن موجوداً
-      - name: Ensure Android Project Exists
+      - name: Create Flutter Android Project Structure
         run: |
           if [ ! -d "android" ]; then
-            flutter create . --platforms=android --org com.qumatix.app
+            flutter create --project-name qumatix_bot --platforms=android --org com.qumatix.app .
           fi
+          rm -rf test
 
-      # 5. توليد ملف الإعدادات والحزم البرمجية (pubspec.yaml)
       - name: Generate pubspec.yaml
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "تطبيق التداول الآلي QuMatix المتصل بالسيرفر"
+          description: "QuMatix Auto Trading App"
           publish_to: 'none'
           version: 1.0.0+1
 
@@ -69,7 +62,6 @@ jobs:
             uses-material-design: true
           EOF
 
-      # 6. توليد ملف محرك الاتصال بالسيرفر (lib/services/quotex_service.dart)
       - name: Generate quotex_service.dart
         run: |
           mkdir -p lib/services
@@ -79,7 +71,6 @@ jobs:
           import 'dart:io';
           import 'package:flutter/foundation.dart';
 
-          // كلاس إدارة الاتصال المباشر بسيرفر التداول عبر WebSocket
           class QuotexService extends ChangeNotifier {
             WebSocket? _socket;
             bool _isConnected = false;
@@ -94,7 +85,6 @@ jobs:
             String get accountType => _accountType;
             List<String> get logs => List.unmodifiable(_logs);
 
-            // دالة لتوثيق الأحداث وعرضها في سجل التطبيق المباشر
             void addLog(String message) {
               final now = DateTime.now();
               final time = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
@@ -102,7 +92,6 @@ jobs:
               notifyListeners();
             }
 
-            // دالة فتح الاتصال الفعلي مع سيرفر المنصة
             Future<void> connect({
               required String ssidToken,
               bool isRealAccount = false,
@@ -116,7 +105,6 @@ jobs:
               try {
                 final wsUri = Uri.parse("wss://ws2.$domain/socket.io/?EIO=3&transport=websocket");
 
-                // ترويسات المتصفح لتجاوز الحماية وقبول الاتصال
                 final headers = {
                   'Origin': 'https://$domain',
                   'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
@@ -131,7 +119,6 @@ jobs:
                 addLog("تم فتح الاتصال بنجاح مع السيرفر ✔");
                 notifyListeners();
 
-                // الاستماع المستمر للبيانات القادمة من السيرفر
                 _socket!.listen(
                   (data) => _handleIncomingData(data.toString(), ssidToken),
                   onError: (err) {
@@ -150,13 +137,11 @@ jobs:
               }
             }
 
-            // معالجة رسائل السيرفر والرد على نبضات الفحص (Ping/Pong)
             void _handleIncomingData(String rawMsg, String token) {
               if (rawMsg.startsWith('0')) {
                 addLog("تم استلام إشارة الترحيب، جاري إرسال المصادقة...");
                 _sendAuthPacket(token);
               } else if (rawMsg == '2') {
-                // إرسال 3 للرد على نبضة السيرفر وإبقاء الاتصال نشطاً
                 _socket?.add('3');
               } else if (rawMsg.startsWith('42')) {
                 try {
@@ -180,7 +165,6 @@ jobs:
               }
             }
 
-            // إرسال حزمة المصادقة باستخدام رمز الجلسة المستخرج
             void _sendAuthPacket(String token) {
               final authData = jsonEncode({
                 "session": token,
@@ -191,7 +175,6 @@ jobs:
               _socket?.add(packet);
             }
 
-            // دالة إرسال أوامر التداول الحقيقية (شراء CALL أو بيع PUT)
             void placeOrder({
               required String asset,
               required String direction,
@@ -216,7 +199,6 @@ jobs:
               addLog("تم إرسال الصفقة: $direction على $asset بقيمة \$$amount");
             }
 
-            // قطع الاتصال وإغلاق القناة بأمان
             Future<void> disconnect() async {
               await _socket?.close();
               _socket = null;
@@ -233,7 +215,6 @@ jobs:
           }
           EOF
 
-      # 7. توليد ملف شاشة تسجيل الدخول التلقائي (lib/screens/login_screen.dart)
       - name: Generate login_screen.dart
         run: |
           mkdir -p lib/screens
@@ -241,7 +222,6 @@ jobs:
           import 'package:flutter/material.dart';
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
-          // شاشة المتصفح المدمج لتسجيل الدخول واستخراج رمز الجلسة تلقائياً
           class QuotexLoginScreen extends StatefulWidget {
             final String domain;
             const QuotexLoginScreen({super.key, this.domain = "qxbroker.com"});
@@ -254,7 +234,6 @@ jobs:
             InAppWebViewController? _webViewController;
             bool _isLoading = true;
 
-            // فحص ملفات تعريف الارتباط (Cookies) لالتقاط الرمز فور نجاح الدخول
             Future<void> _checkCookies() async {
               final cookieManager = CookieManager.instance();
               final cookies = await cookieManager.getCookies(url: WebUri("https://${widget.domain}"));
@@ -309,7 +288,6 @@ jobs:
           }
           EOF
 
-      # 8. توليد ملف الواجهة الرئيسية ولوحة التحكم (lib/main.dart)
       - name: Generate main.dart
         run: |
           cat << 'EOF' > lib/main.dart
@@ -361,7 +339,6 @@ jobs:
             String _selectedAsset = "EURUSD_otc";
             bool _isRealAccount = false;
 
-            // فتح شاشة الدخول والاتصال المباشر بالسيرفر بعد استلام الرمز
             Future<void> _startLoginFlow(BuildContext context) async {
               final service = context.read<QuotexService>();
 
@@ -402,7 +379,6 @@ jobs:
                   padding: const EdgeInsets.all(16.0),
                   child: Column(
                     children: [
-                      // بطاقة إعداد الحساب والاتصال
                       Card(
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         child: Padding(
@@ -458,7 +434,6 @@ jobs:
                         ),
                       ),
                       const SizedBox(height: 14),
-                      // بطاقة عرض الرصيد المباشر وحالة الاتصال
                       Card(
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         child: Padding(
@@ -492,7 +467,6 @@ jobs:
                         ),
                       ),
                       const SizedBox(height: 14),
-                      // بطاقة إرسال صفقات التداول
                       Card(
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         child: Padding(
@@ -576,7 +550,6 @@ jobs:
                         ),
                       ),
                       const SizedBox(height: 14),
-                      // نافذة سجل الأحداث المباشر (Terminal)
                       Card(
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         child: Padding(
@@ -614,22 +587,22 @@ jobs:
           }
           EOF
 
-      # 9. ضبط صلاحيات الإنترنت وإصدار الأندرويد الأدنى (minSdkVersion 21)
       - name: Configure Android Permissions
         run: |
-          sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 21/g' android/app/build.gradle || true
+          if [ -f "android/app/build.gradle" ]; then
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/g' android/app/build.gradle || true
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/g' android/app/build.gradle || true
+          fi
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
             sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"\/>' "$MANIFEST"
           fi
 
-      # 10. تثبيت الحزم البرمجية وبناء ملف APK النهائي
       - name: Install Dependencies & Build APK
         run: |
           flutter pub get
           flutter build apk --release --no-tree-shake-icons
 
-      # 11. رفع ملف الـ APK الجاهز في قسم Artifacts لتنزيله
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
         with:
