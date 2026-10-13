@@ -1,0 +1,637 @@
+# =====================================================================
+# ملف البناء التلقائي الشامل لمشروع QuMatix APK
+# يقوم هذا الملف بإنشاء كافة ملفات Flutter وتجميعها في ملف APK تلقائياً
+# =====================================================================
+name: Build QuMatix APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. سحب بيانات المستودع الحالي
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # 2. تثبيت بيئة جافا 17 الضرورية لبناء تطبيقات أندرويد
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 3. تثبيت بيئة Flutter المستقرة
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      # 4. إنشاء هيكل مشروع أندرويد الأساسي إذا لم يكن موجوداً
+      - name: Ensure Android Project Exists
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create . --platforms=android --org com.qumatix.app
+          fi
+
+      # 5. توليد ملف الإعدادات والحزم البرمجية (pubspec.yaml)
+      - name: Generate pubspec.yaml
+        run: |
+          cat << 'EOF' > pubspec.yaml
+          name: qumatix_bot
+          description: "تطبيق التداول الآلي QuMatix المتصل بالسيرفر"
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            provider: ^6.1.2
+            flutter_inappwebview: ^6.1.5
+            shared_preferences: ^2.2.3
+            cupertino_icons: ^1.0.6
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+
+      # 6. توليد ملف محرك الاتصال بالسيرفر (lib/services/quotex_service.dart)
+      - name: Generate quotex_service.dart
+        run: |
+          mkdir -p lib/services
+          cat << 'EOF' > lib/services/quotex_service.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/foundation.dart';
+
+          // كلاس إدارة الاتصال المباشر بسيرفر التداول عبر WebSocket
+          class QuotexService extends ChangeNotifier {
+            WebSocket? _socket;
+            bool _isConnected = false;
+            bool _isAuthenticated = false;
+            double _balance = 0.0;
+            String _accountType = "demo";
+            final List<String> _logs = [];
+
+            bool get isConnected => _isConnected;
+            bool get isAuthenticated => _isAuthenticated;
+            double get balance => _balance;
+            String get accountType => _accountType;
+            List<String> get logs => List.unmodifiable(_logs);
+
+            // دالة لتوثيق الأحداث وعرضها في سجل التطبيق المباشر
+            void addLog(String message) {
+              final now = DateTime.now();
+              final time = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
+              _logs.insert(0, "[$time] $message");
+              notifyListeners();
+            }
+
+            // دالة فتح الاتصال الفعلي مع سيرفر المنصة
+            Future<void> connect({
+              required String ssidToken,
+              bool isRealAccount = false,
+              String domain = "qxbroker.com",
+            }) async {
+              await disconnect();
+              _accountType = isRealAccount ? "real" : "demo";
+
+              addLog("جاري الاتصال بسيرفر $domain...");
+
+              try {
+                final wsUri = Uri.parse("wss://ws2.$domain/socket.io/?EIO=3&transport=websocket");
+
+                // ترويسات المتصفح لتجاوز الحماية وقبول الاتصال
+                final headers = {
+                  'Origin': 'https://$domain',
+                  'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+                };
+
+                _socket = await WebSocket.connect(
+                  wsUri.toString(),
+                  headers: headers,
+                );
+
+                _isConnected = true;
+                addLog("تم فتح الاتصال بنجاح مع السيرفر ✔");
+                notifyListeners();
+
+                // الاستماع المستمر للبيانات القادمة من السيرفر
+                _socket!.listen(
+                  (data) => _handleIncomingData(data.toString(), ssidToken),
+                  onError: (err) {
+                    addLog("خطأ في الاتصال: $err");
+                    disconnect();
+                  },
+                  onDone: () {
+                    addLog("تم قطع الاتصال من قِبل السيرفر.");
+                    disconnect();
+                  },
+                );
+              } catch (e) {
+                addLog("فشل الاتصال بالسيرفر: $e");
+                _isConnected = false;
+                notifyListeners();
+              }
+            }
+
+            // معالجة رسائل السيرفر والرد على نبضات الفحص (Ping/Pong)
+            void _handleIncomingData(String rawMsg, String token) {
+              if (rawMsg.startsWith('0')) {
+                addLog("تم استلام إشارة الترحيب، جاري إرسال المصادقة...");
+                _sendAuthPacket(token);
+              } else if (rawMsg == '2') {
+                // إرسال 3 للرد على نبضة السيرفر وإبقاء الاتصال نشطاً
+                _socket?.add('3');
+              } else if (rawMsg.startsWith('42')) {
+                try {
+                  final jsonPart = rawMsg.substring(2);
+                  final List<dynamic> eventList = jsonDecode(jsonPart);
+                  final String eventName = eventList[0].toString();
+
+                  if (eventName.contains("authorization") || eventName == "authorization/success") {
+                    _isAuthenticated = true;
+                    addLog("تم التحقق من الحساب وتسجيل الدخول بنجاح! 🎉");
+                    notifyListeners();
+                  } else if (eventName.contains("balance")) {
+                    final data = eventList[1];
+                    if (data is Map && data.containsKey('balance')) {
+                      _balance = (data['balance'] as num).toDouble();
+                      addLog("تم تحديث الرصيد: \$$_balance");
+                      notifyListeners();
+                    }
+                  }
+                } catch (_) {}
+              }
+            }
+
+            // إرسال حزمة المصادقة باستخدام رمز الجلسة المستخرج
+            void _sendAuthPacket(String token) {
+              final authData = jsonEncode({
+                "session": token,
+                "isDemo": _accountType == "demo" ? 1 : 0,
+                "tournamentId": 0,
+              });
+              final packet = '42["authorization", $authData]';
+              _socket?.add(packet);
+            }
+
+            // دالة إرسال أوامر التداول الحقيقية (شراء CALL أو بيع PUT)
+            void placeOrder({
+              required String asset,
+              required String direction,
+              required double amount,
+              required int duration,
+            }) {
+              if (!_isConnected || _socket == null) {
+                addLog("تنبيه: لا يوجد اتصال فعال بالسيرفر لإرسال الصفقة.");
+                return;
+              }
+
+              final orderData = jsonEncode({
+                "asset": asset,
+                "amount": amount,
+                "action": direction.toLowerCase(),
+                "time": duration,
+                "isDemo": _accountType == "demo" ? 1 : 0,
+              });
+
+              final orderPacket = '42["orders/open", $orderData]';
+              _socket?.add(orderPacket);
+              addLog("تم إرسال الصفقة: $direction على $asset بقيمة \$$amount");
+            }
+
+            // قطع الاتصال وإغلاق القناة بأمان
+            Future<void> disconnect() async {
+              await _socket?.close();
+              _socket = null;
+              _isConnected = false;
+              _isAuthenticated = false;
+              notifyListeners();
+            }
+
+            @override
+            void dispose() {
+              disconnect();
+              super.dispose();
+            }
+          }
+          EOF
+
+      # 7. توليد ملف شاشة تسجيل الدخول التلقائي (lib/screens/login_screen.dart)
+      - name: Generate login_screen.dart
+        run: |
+          mkdir -p lib/screens
+          cat << 'EOF' > lib/screens/login_screen.dart
+          import 'package:flutter/material.dart';
+          import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+
+          // شاشة المتصفح المدمج لتسجيل الدخول واستخراج رمز الجلسة تلقائياً
+          class QuotexLoginScreen extends StatefulWidget {
+            final String domain;
+            const QuotexLoginScreen({super.key, this.domain = "qxbroker.com"});
+
+            @override
+            State<QuotexLoginScreen> createState() => _QuotexLoginScreenState();
+          }
+
+          class _QuotexLoginScreenState extends State<QuotexLoginScreen> {
+            InAppWebViewController? _webViewController;
+            bool _isLoading = true;
+
+            // فحص ملفات تعريف الارتباط (Cookies) لالتقاط الرمز فور نجاح الدخول
+            Future<void> _checkCookies() async {
+              final cookieManager = CookieManager.instance();
+              final cookies = await cookieManager.getCookies(url: WebUri("https://${widget.domain}"));
+
+              String? foundToken;
+              for (var cookie in cookies) {
+                if (cookie.name == 'ssid' || cookie.name == 'keep_code' || cookie.name == 'token') {
+                  foundToken = cookie.value;
+                  break;
+                }
+              }
+
+              if (foundToken != null && mounted) {
+                Navigator.pop(context, foundToken);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text("تسجيل الدخول إلى حسابك"),
+                  backgroundColor: const Color(0xFF1E293B),
+                  actions: [
+                    IconButton(
+                      icon: const Icon(Icons.check),
+                      tooltip: "تأكيد الدخول",
+                      onPressed: _checkCookies,
+                    ),
+                  ],
+                ),
+                body: Stack(
+                  children: [
+                    InAppWebView(
+                      initialUrlRequest: URLRequest(
+                        url: WebUri("https://${widget.domain}/ar/sign-in"),
+                      ),
+                      onWebViewCreated: (controller) => _webViewController = controller,
+                      onLoadStop: (controller, url) async {
+                        setState(() => _isLoading = false);
+                        await _checkCookies();
+                      },
+                    ),
+                    if (_isLoading)
+                      const Center(
+                        child: CircularProgressIndicator(),
+                      ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      # 8. توليد ملف الواجهة الرئيسية ولوحة التحكم (lib/main.dart)
+      - name: Generate main.dart
+        run: |
+          cat << 'EOF' > lib/main.dart
+          import 'package:flutter/material.dart';
+          import 'package:provider/provider.dart';
+          import 'services/quotex_service.dart';
+          import 'screens/login_screen.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(
+              ChangeNotifierProvider(
+                create: (_) => QuotexService(),
+                child: const QuMatixApp(),
+              ),
+            );
+          }
+
+          class QuMatixApp extends StatelessWidget {
+            const QuMatixApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'QuMatix Auto Trader',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData.dark().copyWith(
+                  scaffoldBackgroundColor: const Color(0xFF0F172A),
+                  cardColor: const Color(0xFF1E293B),
+                  colorScheme: const ColorScheme.dark(
+                    primary: Color(0xFF10B981),
+                    secondary: Color(0xFFEF4444),
+                  ),
+                ),
+                home: const MainDashboard(),
+              );
+            }
+          }
+
+          class MainDashboard extends StatefulWidget {
+            const MainDashboard({super.key});
+
+            @override
+            State<MainDashboard> createState() => _MainDashboardState();
+          }
+
+          class _MainDashboardState extends State<MainDashboard> {
+            final TextEditingController _amountController = TextEditingController(text: "1");
+            String _selectedAsset = "EURUSD_otc";
+            bool _isRealAccount = false;
+
+            // فتح شاشة الدخول والاتصال المباشر بالسيرفر بعد استلام الرمز
+            Future<void> _startLoginFlow(BuildContext context) async {
+              final service = context.read<QuotexService>();
+
+              final token = await Navigator.push<String>(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const QuotexLoginScreen(domain: "qxbroker.com"),
+                ),
+              );
+
+              if (token != null && token.isNotEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text("تم استخراج الجلسة بنجاح! جاري الاتصال بالسيرفر..."),
+                    backgroundColor: Colors.green,
+                  ),
+                );
+
+                await service.connect(
+                  ssidToken: token,
+                  isRealAccount: _isRealAccount,
+                  domain: "qxbroker.com",
+                );
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final service = context.watch<QuotexService>();
+
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text("QuMatix Trading Bot", style: TextStyle(fontWeight: FontWeight.bold)),
+                  backgroundColor: const Color(0xFF1E293B),
+                  centerTitle: true,
+                ),
+                body: SingleChildScrollView(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    children: [
+                      // بطاقة إعداد الحساب والاتصال
+                      Card(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  const Text("نوع الحساب:", style: TextStyle(fontWeight: FontWeight.bold)),
+                                  Row(
+                                    children: [
+                                      ChoiceChip(
+                                        label: const Text("تجريبي (Demo)"),
+                                        selected: !_isRealAccount,
+                                        onSelected: (val) => setState(() => _isRealAccount = !val),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      ChoiceChip(
+                                        label: const Text("حقيقي (Real)"),
+                                        selected: _isRealAccount,
+                                        selectedColor: Colors.amber.shade800,
+                                        onSelected: (val) => setState(() => _isRealAccount = val),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              SizedBox(
+                                width: double.infinity,
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: service.isConnected ? Colors.red.shade700 : const Color(0xFF2563EB),
+                                    padding: const EdgeInsets.symmetric(vertical: 14),
+                                  ),
+                                  onPressed: () {
+                                    if (service.isConnected) {
+                                      service.disconnect();
+                                    } else {
+                                      _startLoginFlow(context);
+                                    }
+                                  },
+                                  icon: Icon(service.isConnected ? Icons.link_off : Icons.login),
+                                  label: Text(
+                                    service.isConnected ? "قطع الاتصال بالسيرفر" : "تسجيل الدخول والاتصال التلقائي",
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      // بطاقة عرض الرصيد المباشر وحالة الاتصال
+                      Card(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text("الرصيد المتاح بالسيرفر", style: TextStyle(color: Colors.grey)),
+                                  Text(
+                                    "\$${service.balance.toStringAsFixed(2)}",
+                                    style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.greenAccent),
+                                  ),
+                                ],
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                decoration: BoxDecoration(
+                                  color: service.isConnected ? Colors.green.shade900 : Colors.red.shade900,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                child: Text(
+                                  service.isConnected ? (service.isAuthenticated ? "متصل ومصادق" : "متصل بالسيرفر") : "غير متصل",
+                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      // بطاقة إرسال صفقات التداول
+                      Card(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text("تنفيذ صفقات التداول", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                              const SizedBox(height: 12),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: DropdownButtonFormField<String>(
+                                      value: _selectedAsset,
+                                      decoration: const InputDecoration(border: OutlineInputBorder(), labelText: "الزوج"),
+                                      items: const [
+                                        DropdownMenuItem(value: "EURUSD_otc", child: Text("EUR/USD (OTC)")),
+                                        DropdownMenuItem(value: "GBPUSD_otc", child: Text("GBP/USD (OTC)")),
+                                        DropdownMenuItem(value: "USDJPY_otc", child: Text("USD/JPY (OTC)")),
+                                        DropdownMenuItem(value: "BTCUSD", child: Text("Bitcoin")),
+                                      ],
+                                      onChanged: (val) => setState(() => _selectedAsset = val!),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: TextField(
+                                      controller: _amountController,
+                                      keyboardType: TextInputType.number,
+                                      decoration: const InputDecoration(labelText: "المبلغ (\$)", border: OutlineInputBorder()),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 14),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.green,
+                                        padding: const EdgeInsets.symmetric(vertical: 14),
+                                      ),
+                                      onPressed: () {
+                                        final amt = double.tryParse(_amountController.text) ?? 1.0;
+                                        service.placeOrder(
+                                          asset: _selectedAsset,
+                                          direction: "call",
+                                          amount: amt,
+                                          duration: 60,
+                                        );
+                                      },
+                                      icon: const Icon(Icons.arrow_upward),
+                                      label: const Text("شراء (CALL)"),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.red,
+                                        padding: const EdgeInsets.symmetric(vertical: 14),
+                                      ),
+                                      onPressed: () {
+                                        final amt = double.tryParse(_amountController.text) ?? 1.0;
+                                        service.placeOrder(
+                                          asset: _selectedAsset,
+                                          direction: "put",
+                                          amount: amt,
+                                          duration: 60,
+                                        );
+                                      },
+                                      icon: const Icon(Icons.arrow_downward),
+                                      label: const Text("بيع (PUT)"),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      // نافذة سجل الأحداث المباشر (Terminal)
+                      Card(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text("سجل الأحداث والاتصال المباشر", style: TextStyle(fontWeight: FontWeight.bold)),
+                              const SizedBox(height: 8),
+                              Container(
+                                height: 150,
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(
+                                  color: Colors.black,
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: ListView.builder(
+                                  itemCount: service.logs.length,
+                                  itemBuilder: (context, idx) => Text(
+                                    service.logs[idx],
+                                    style: const TextStyle(color: Colors.greenAccent, fontSize: 12, fontFamily: 'monospace'),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      # 9. ضبط صلاحيات الإنترنت وإصدار الأندرويد الأدنى (minSdkVersion 21)
+      - name: Configure Android Permissions
+        run: |
+          sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 21/g' android/app/build.gradle || true
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"\/>' "$MANIFEST"
+          fi
+
+      # 10. تثبيت الحزم البرمجية وبناء ملف APK النهائي
+      - name: Install Dependencies & Build APK
+        run: |
+          flutter pub get
+          flutter build apk --release --no-tree-shake-icons
+
+      # 11. رفع ملف الـ APK الجاهز في قسم Artifacts لتنزيله
+      - name: Upload APK to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuMatix-App-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
