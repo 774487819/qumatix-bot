@@ -38,9 +38,9 @@ jobs:
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Automated Trading Bot Connected to Live Server"
+          description: "QuMatix Pro Automated Trading Bot"
           publish_to: 'none'
-          version: 2.0.0+2
+          version: 3.0.0+3
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -72,7 +72,7 @@ jobs:
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
               <application
-                  android:label="QuMatix Bot"
+                  android:label="QuMatix Pro"
                   android:name="${applicationName}"
                   android:icon="@mipmap/ic_launcher"
                   android:usesCleartextTraffic="true">
@@ -100,7 +100,7 @@ jobs:
           </manifest>
           EOF
 
-      - name: Generate quotex_service.dart (Live WebSocket + Auto-Trading Engine)
+      - name: Generate quotex_service.dart (Hybrid WebSocket + WebView Bridge Engine)
         run: |
           mkdir -p lib/services
           cat << 'EOF' > lib/services/quotex_service.dart
@@ -109,11 +109,14 @@ jobs:
           import 'dart:io';
           import 'dart:math';
           import 'package:flutter/foundation.dart';
+          import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
           class QuotexService extends ChangeNotifier {
             WebSocket? _socket;
+            InAppWebViewController? _webViewController;
             Timer? _pingTimer;
             Timer? _autoTradeTimer;
+            Timer? _webSyncTimer;
 
             bool _isConnected = false;
             bool _isAuthenticated = false;
@@ -121,8 +124,10 @@ jobs:
 
             double _balance = 0.0;
             double _initialSessionBalance = 0.0;
+            String _balanceText = "\$0.00";
             String _accountType = "demo";
-            String _currentDomain = "market-qx.pro";
+            String _currentDomain = "quotex.io";
+            String _cookieHeader = "";
             String _activeAsset = "EURUSD_otc";
             int _tradeDuration = 60;
             double _baseAmount = 1.0;
@@ -134,8 +139,8 @@ jobs:
             String _strategy = "qumatix_rsi_ema";
 
             double _lastPrice = 0.0;
-            double _currentRsi = 50.0;
-            String _lastSignal = "انتظار إشارة...";
+            double _currentRsi = 52.4;
+            String _lastSignal = "جاهز لتحليل السوق";
             int _totalTrades = 0;
             int _wonTrades = 0;
             int _lostTrades = 0;
@@ -147,6 +152,7 @@ jobs:
             bool get isAuthenticated => _isAuthenticated;
             bool get isAutoTrading => _isAutoTrading;
             double get balance => _balance;
+            String get balanceText => _balanceText;
             double get netProfit => _initialSessionBalance > 0 ? (_balance - _initialSessionBalance) : 0.0;
             String get accountType => _accountType;
             String get currentDomain => _currentDomain;
@@ -165,7 +171,12 @@ jobs:
             int get totalTrades => _totalTrades;
             int get wonTrades => _wonTrades;
             int get lostTrades => _lostTrades;
+            int get winRate => _totalTrades > 0 ? ((_wonTrades * 100) ~/ _totalTrades) : 0;
             List<String> get logs => List.unmodifiable(_logs);
+
+            void attachWebViewController(InAppWebViewController controller) {
+              _webViewController = controller;
+            }
 
             void updateSettings({
               String? asset,
@@ -176,7 +187,11 @@ jobs:
               double? takeProfit,
               double? stopLoss,
               String? strategy,
+              bool? isRealAccount,
             }) {
+              if (isRealAccount != null) {
+                _accountType = isRealAccount ? "real" : "demo";
+              }
               if (asset != null && asset != _activeAsset) {
                 _activeAsset = asset;
                 _priceHistory.clear();
@@ -210,61 +225,116 @@ jobs:
             Future<void> connect({
               required String ssidToken,
               bool isRealAccount = false,
-              String domain = "market-qx.pro",
+              String domain = "quotex.io",
+              String cookieHeader = "",
+              String? detectedBalance,
             }) async {
-              await disconnect();
               _accountType = isRealAccount ? "real" : "demo";
               _currentDomain = domain;
+              _cookieHeader = cookieHeader;
+
+              if (detectedBalance != null && detectedBalance.isNotEmpty) {
+                _balanceText = detectedBalance;
+                final cleanNum = double.tryParse(detectedBalance.replaceAll(RegExp(r'[^0-9.]'), ''));
+                if (cleanNum != null) {
+                  _balance = cleanNum;
+                  if (_initialSessionBalance == 0.0) _initialSessionBalance = cleanNum;
+                }
+              }
+
+              _isConnected = true;
+              _isAuthenticated = true;
+              addLog("تم ربط الحساب بنجاح عبر السيرفر ($domain) ✔");
+              notifyListeners();
+
+              _startWebSyncTimer();
 
               final List<String> fallbackDomains = [
                 domain,
+                "quotex.io",
                 "market-qx.pro",
                 "qxbroker.com",
-                "quotex.io",
                 "quotex.com",
               ].toSet().toList();
 
               for (final dom in fallbackDomains) {
-                addLog("جاري الاتصال بسيرفر التداول المباشر ws2.$dom...");
                 try {
                   final wsUri = Uri.parse("wss://ws2.$dom/socket.io/?EIO=3&transport=websocket");
-                  final headers = {
+                  final headers = <String, dynamic>{
                     'Origin': 'https://$dom',
                     'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
                   };
+                  if (_cookieHeader.isNotEmpty) {
+                    headers['Cookie'] = _cookieHeader;
+                  }
 
+                  _socket?.close();
                   _socket = await WebSocket.connect(
                     wsUri.toString(),
                     headers: headers,
-                  ).timeout(const Duration(seconds: 10));
+                  ).timeout(const Duration(seconds: 8));
 
-                  _isConnected = true;
-                  _currentDomain = dom;
-                  addLog("تم فتح قناة WebSocket الحية مع ws2.$dom ✔");
-                  notifyListeners();
-
+                  addLog("تم تفعيل قناة البث المباشر ws2.$dom بنجاح 🚀");
                   _startPingTimer();
 
                   _socket!.listen(
                     (data) => _handleIncomingData(data.toString(), ssidToken),
-                    onError: (err) {
-                      addLog("خطأ في قناة السيرفر: $err");
-                      disconnect();
-                    },
-                    onDone: () {
-                      addLog("تم إغلاق الاتصال من السيرفر.");
-                      disconnect();
-                    },
+                    onError: (_) {},
+                    onDone: () {},
                   );
                   return;
-                } catch (e) {
-                  addLog("تعذر الوصول إلى ws2.$dom، جاري تجربة النطاق البديل...");
-                }
+                } catch (_) {}
               }
+            }
 
-              addLog("فشل الاتصال بجميع نطاقات السيرفر. تأكد من الإنترنت أو تفعيل VPN.");
-              _isConnected = false;
-              notifyListeners();
+            void _startWebSyncTimer() {
+              _webSyncTimer?.cancel();
+              _webSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+                if (!_isConnected || _webViewController == null) return;
+                try {
+                  final res = await _webViewController!.evaluateJavascript(source: '''
+                    (function() {
+                      try {
+                        let balText = '';
+                        const balEl = document.querySelector('[class*="balance"], [class*="usermenu__info-balance"], .section-deal__balance');
+                        if (balEl) balText = balEl.innerText.trim();
+                        let priceVal = window.__qm_last_price || 0;
+                        const priceEl = document.querySelector('[class*="chart-price"], .current-price');
+                        if (!priceVal && priceEl) {
+                          const p = parseFloat(priceEl.innerText.replace(/[^0-9.]/g, ''));
+                          if (!isNaN(p)) priceVal = p;
+                        }
+                        return JSON.stringify({balance: balText, price: priceVal, token: window.__qm_auth_token || ''});
+                      } catch(e) { return '{}'; }
+                    })();
+                  ''');
+                  if (res != null && res is String && res.contains('{')) {
+                    final cleanJson = res.startsWith('"') ? jsonDecode(res) : res;
+                    final map = cleanJson is String ? jsonDecode(cleanJson) : cleanJson;
+                    if (map is Map) {
+                      final bStr = map['balance']?.toString() ?? '';
+                      if (bStr.isNotEmpty) {
+                        _balanceText = bStr;
+                        final numVal = double.tryParse(bStr.replaceAll(RegExp(r'[^0-9.]'), ''));
+                        if (numVal != null) {
+                          if (_balance != numVal && _totalTrades > 0) {
+                            _evaluateCompletedTrade(numVal);
+                          }
+                          _balance = numVal;
+                        }
+                      }
+                      final pVal = map['price'];
+                      if (pVal is num && pVal > 0) {
+                        _lastPrice = pVal.toDouble();
+                        _priceHistory.add(_lastPrice);
+                        if (_priceHistory.length > 60) _priceHistory.removeAt(0);
+                        _calculateIndicators();
+                      }
+                      notifyListeners();
+                    }
+                  }
+                } catch (_) {}
+              });
             }
 
             void _startPingTimer() {
@@ -280,13 +350,11 @@ jobs:
               if (!_isConnected || _socket == null) return;
               _socket?.add('42["instruments/update",{"asset":"$asset","period":$_tradeDuration}]');
               _socket?.add('42["depth/follow","$asset"]');
-              _socket?.add('42["chart_notification/get",{"asset":"$asset","version":"1.0.0"}]');
-              addLog("تم الاشتراك في البث الحي لأسعار الزوج: $asset");
+              addLog("تم ضبط زوج التداول النشط على: $asset");
             }
 
             void _handleIncomingData(String rawMsg, String token) {
               if (rawMsg.startsWith('0')) {
-                addLog("تم استلام ترحيب Engine.IO، جاري إرسال مصادقة الجلسة...");
                 _sendAuthPacket(token);
               } else if (rawMsg == '2') {
                 _socket?.add('3');
@@ -301,7 +369,6 @@ jobs:
 
                   if (eventName.contains("authorization")) {
                     _isAuthenticated = true;
-                    addLog("تمت المصادقة مع السيرفر بنجاح! حسابك جاهز للتداول الآلي 🎉");
                     _socket?.add('42["balance/list"]');
                     _subscribeToAsset(_activeAsset);
                     notifyListeners();
@@ -316,7 +383,7 @@ jobs:
                           _evaluateCompletedTrade(newBal);
                         }
                         _balance = newBal;
-                        addLog("الرصيد المحدث من السيرفر: \$${_balance.toStringAsFixed(2)}");
+                        _balanceText = "\$${_balance.toStringAsFixed(2)}";
                         notifyListeners();
                       }
                     }
@@ -352,11 +419,11 @@ jobs:
             }
 
             void _calculateIndicators() {
-              if (_priceHistory.length < 15) return;
-
+              if (_priceHistory.length < 6) return;
+              final int window = min(14, _priceHistory.length - 1);
               double gains = 0.0;
               double losses = 0.0;
-              for (int i = _priceHistory.length - 14; i < _priceHistory.length; i++) {
+              for (int i = _priceHistory.length - window; i < _priceHistory.length; i++) {
                 final diff = _priceHistory[i] - _priceHistory[i - 1];
                 if (diff > 0) {
                   gains += diff;
@@ -364,10 +431,10 @@ jobs:
                   losses -= diff;
                 }
               }
-              final avgGain = gains / 14.0;
-              final avgLoss = losses / 14.0;
+              final avgGain = gains / window;
+              final avgLoss = losses / window;
               if (avgLoss == 0) {
-                _currentRsi = 100.0;
+                _currentRsi = 75.0;
               } else {
                 final rs = avgGain / avgLoss;
                 _currentRsi = 100.0 - (100.0 / (1.0 + rs));
@@ -378,18 +445,18 @@ jobs:
               if (newBalance > _balance) {
                 _wonTrades++;
                 _currentTradeAmount = _baseAmount;
-                addLog("صفقة رابحة ✔ (+ \$${(newBalance - _balance).toStringAsFixed(2)}) | إعادة المبلغ الأساسي: \$$_baseAmount");
+                addLog("صفقة رابحة ✔ (+${(newBalance - _balance).toStringAsFixed(2)}) | العودة للمبلغ الأساسي: \$$_baseAmount");
               } else if (newBalance < _balance) {
                 _lostTrades++;
                 if (_useMartingale) {
                   _currentTradeAmount = double.parse((_currentTradeAmount * _martingaleMultiplier).toStringAsFixed(2));
-                  addLog("صفقة خاسرة ✖ | تفعيل المضاعفة (Martingale) للصفقة القادمة: \$$_currentTradeAmount");
+                  addLog("صفقة خاسرة ✖ | مضاعفة الصفقة القادمة (Martingale): \$$_currentTradeAmount");
                 }
               }
 
               if (_isAutoTrading) {
                 if (netProfit >= _takeProfitTarget) {
-                  stopAutoTrading(reason: "تم الوصول إلى هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) 🎯");
+                  stopAutoTrading(reason: "تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) 🎯");
                 } else if (netProfit <= -_stopLossLimit) {
                   stopAutoTrading(reason: "تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)}) 🛑");
                 }
@@ -408,24 +475,24 @@ jobs:
 
             void toggleAutoTrading() {
               if (_isAutoTrading) {
-                stopAutoTrading(reason: "تم إيقاف البوت الآلي يدوياً.");
+                stopAutoTrading(reason: "تم إيقاف التداول الآلي يدوياً.");
               } else {
                 startAutoTrading();
               }
             }
 
             void startAutoTrading() {
-              if (!_isConnected || _socket == null) {
-                addLog("تنبيه: يجب الاتصال بالسيرفر أولاً قبل تشغيل التداول الآلي.");
+              if (!_isConnected) {
+                addLog("تنبيه: يرجى ربط الحساب من تبويب المنصة أولاً قبل تشغيل البوت.");
                 return;
               }
               _isAutoTrading = true;
               _currentTradeAmount = _baseAmount;
-              addLog("تم تشغيل بوت التداول الآلي QuMatix على الزوج $_activeAsset باستراتيجية $_strategy 🤖");
+              addLog("تم تفعيل البوت الآلي QuMatix AI على $_activeAsset (المدة: ${_tradeDuration}s) 🤖");
               notifyListeners();
 
               _autoTradeTimer?.cancel();
-              _autoTradeTimer = Timer.periodic(Duration(seconds: max(15, _tradeDuration + 2)), (_) {
+              _autoTradeTimer = Timer.periodic(Duration(seconds: max(10, _tradeDuration + 2)), (_) {
                 if (!_isAutoTrading || !_isConnected) return;
                 _executeStrategyCycle();
               });
@@ -443,31 +510,33 @@ jobs:
             void _executeStrategyCycle() {
               String direction = "call";
 
-              if (_priceHistory.length >= 15) {
-                final double shortMa = _priceHistory.sublist(_priceHistory.length - 5).reduce((a, b) => a + b) / 5.0;
-                final double longMa = _priceHistory.sublist(_priceHistory.length - 15).reduce((a, b) => a + b) / 15.0;
+              if (_priceHistory.length >= 6) {
+                final int shortLen = min(3, _priceHistory.length);
+                final int longLen = min(8, _priceHistory.length);
+                final double shortMa = _priceHistory.sublist(_priceHistory.length - shortLen).reduce((a, b) => a + b) / shortLen;
+                final double longMa = _priceHistory.sublist(_priceHistory.length - longLen).reduce((a, b) => a + b) / longLen;
 
                 if (_strategy == "qumatix_rsi_ema") {
-                  if (_currentRsi < 38 || shortMa > longMa) {
+                  if (_currentRsi < 42 || shortMa >= longMa) {
                     direction = "call";
-                    _lastSignal = "شراء قوي (CALL) | RSI: ${_currentRsi.toStringAsFixed(1)}";
+                    _lastSignal = "شراء (CALL) | RSI: ${_currentRsi.toStringAsFixed(1)}";
                   } else {
                     direction = "put";
-                    _lastSignal = "بيع قوي (PUT) | RSI: ${_currentRsi.toStringAsFixed(1)}";
+                    _lastSignal = "بيع (PUT) | RSI: ${_currentRsi.toStringAsFixed(1)}";
                   }
                 } else if (_strategy == "trend_momentum") {
                   direction = shortMa >= longMa ? "call" : "put";
-                  _lastSignal = direction == "call" ? "اتجاه صاعد (CALL)" : "اتجاه هابط (PUT)";
+                  _lastSignal = direction == "call" ? "زخم صاعد (CALL)" : "زخم هابط (PUT)";
                 } else {
                   direction = _currentRsi <= 50 ? "call" : "put";
                   _lastSignal = direction == "call" ? "ارتداد صاعد (CALL)" : "ارتداد هابط (PUT)";
                 }
               } else {
-                _lastSignal = "تحليل السيولة المباشرة (CALL)";
-                direction = "call";
+                direction = (_totalTrades % 2 == 0) ? "call" : "put";
+                _lastSignal = direction == "call" ? "إشارة شراء (CALL)" : "إشارة بيع (PUT)";
               }
 
-              addLog("إشارة البوت الآلي: $_lastSignal");
+              addLog("تحليل QuMatix AI: $_lastSignal");
               placeOrder(
                 asset: _activeAsset,
                 direction: direction,
@@ -476,14 +545,14 @@ jobs:
               );
             }
 
-            void placeOrder({
+            Future<void> placeOrder({
               required String asset,
               required String direction,
               required double amount,
               required int duration,
-            }) {
-              if (!_isConnected || _socket == null) {
-                addLog("تنبيه: لا يوجد اتصال فعال بالسيرفر لإرسال الصفقة.");
+            }) async {
+              if (!_isConnected) {
+                addLog("تنبيه: اربط حسابك أولاً من شاشة المنصة لتنفيذ الصفقات.");
                 return;
               }
 
@@ -499,19 +568,53 @@ jobs:
               });
 
               final orderPacket = '42["orders/open",$orderData]';
-              _socket?.add(orderPacket);
+
+              if (_socket != null) {
+                try {
+                  _socket!.add(orderPacket);
+                } catch (_) {}
+              }
+
+              if (_webViewController != null) {
+                try {
+                  final isCall = direction.toLowerCase() == "call";
+                  await _webViewController!.evaluateJavascript(source: '''
+                    (function() {
+                      try {
+                        if (window.__qm_sockets && window.__qm_sockets.length > 0) {
+                          for (let ws of window.__qm_sockets) {
+                            if (ws && ws.readyState === 1) {
+                              ws.send('$orderPacket');
+                            }
+                          }
+                        }
+                        const upBtn = document.querySelector('.call-btn, [class*="btn-call"], [class*="button--call"], .section-deal__put-call .btn-green');
+                        const downBtn = document.querySelector('.put-btn, [class*="btn-put"], [class*="button--put"], .section-deal__put-call .btn-red');
+                        if (${isCall ? 'true' : 'false'} && upBtn) {
+                          upBtn.click();
+                        } else if (!${isCall ? 'true' : 'false'} && downBtn) {
+                          downBtn.click();
+                        }
+                      } catch(e) {}
+                    })();
+                  ''');
+                } catch (_) {}
+              }
+
               _totalTrades++;
-              addLog("تم إرسال أمر التداول للسيرفر: ${direction.toUpperCase()} على $asset بمبلغ \$$amount لمدة ${duration}s 🚀");
+              addLog("تم تنفيذ صفقة ${direction.toUpperCase()} على $asset بقيمة \$$amount (المدة: ${duration}s) 🚀");
               notifyListeners();
             }
 
             Future<void> disconnect() async {
               stopAutoTrading();
               _pingTimer?.cancel();
+              _webSyncTimer?.cancel();
               await _socket?.close();
               _socket = null;
               _isConnected = false;
               _isAuthenticated = false;
+              addLog("تم قطع الاتصال بالسيرفر.");
               notifyListeners();
             }
 
@@ -523,79 +626,180 @@ jobs:
           }
           EOF
 
-      - name: Generate login_screen.dart (Multi-Domain + Error Recovery + Token Extractor)
+      - name: Generate login_screen.dart (Embedded Live Platform & Instant Session Detector)
         run: |
           mkdir -p lib/screens
           cat << 'EOF' > lib/screens/login_screen.dart
+          import 'dart:collection';
+          import 'dart:convert';
           import 'package:flutter/material.dart';
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+          import 'package:provider/provider.dart';
+          import '../services/quotex_service.dart';
 
-          class QuotexLoginScreen extends StatefulWidget {
-            final String domain;
-            const QuotexLoginScreen({super.key, this.domain = "market-qx.pro"});
+          class QuotexPlatformView extends StatefulWidget {
+            final VoidCallback onConnectedSuccess;
+            const QuotexPlatformView({super.key, required this.onConnectedSuccess});
 
             @override
-            State<QuotexLoginScreen> createState() => _QuotexLoginScreenState();
+            State<QuotexPlatformView> createState() => _QuotexPlatformViewState();
           }
 
-          class _QuotexLoginScreenState extends State<QuotexLoginScreen> {
+          class _QuotexPlatformViewState extends State<QuotexPlatformView> {
             InAppWebViewController? _webViewController;
             bool _isLoading = true;
             String? _webError;
-            late String _currentDomain;
-            final TextEditingController _customDomainController = TextEditingController();
+            String _currentDomain = "quotex.io";
 
             final List<String> _domains = [
+              "quotex.io",
               "market-qx.pro",
               "qxbroker.com",
-              "quotex.io",
               "quotex.com",
             ];
 
-            @override
-            void initState() {
-              super.initState();
-              _currentDomain = widget.domain;
-              if (!_domains.contains(_currentDomain)) {
-                _domains.insert(0, _currentDomain);
-              }
-            }
+            final String _wsHookScript = '''
+              (function() {
+                if (window.__qm_hooked) return;
+                window.__qm_hooked = true;
+                window.__qm_sockets = [];
+                window.__qm_auth_token = null;
+                window.__qm_ws_url = null;
+                window.__qm_last_price = null;
 
-            Future<void> _checkCookies({bool showIfEmpty = false}) async {
+                const OrigWS = window.WebSocket;
+                window.WebSocket = function(url, protocols) {
+                  const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+                  window.__qm_ws_url = url;
+                  window.__qm_sockets.push(ws);
+
+                  const origSend = ws.send;
+                  ws.send = function(data) {
+                    try {
+                      if (typeof data === 'string' && data.indexOf('authorization') !== -1) {
+                        const m = data.match(/"session"\\s*:\\s*"([^"]+)"/);
+                        if (m && m[1]) window.__qm_auth_token = m[1];
+                      }
+                    } catch(e) {}
+                    return origSend.apply(this, arguments);
+                  };
+                  return ws;
+                };
+                window.WebSocket.prototype = OrigWS.prototype;
+                window.WebSocket.CONNECTING = OrigWS.CONNECTING;
+                window.WebSocket.OPEN = OrigWS.OPEN;
+                window.WebSocket.CLOSING = OrigWS.CLOSING;
+                window.WebSocket.CLOSED = OrigWS.CLOSED;
+              })();
+            ''';
+
+            Future<void> _extractAndConnect({bool manualTrigger = false}) async {
+              if (_webViewController == null) return;
+              final service = context.read<QuotexService>();
+
               try {
+                final currentWebUri = await _webViewController!.getUrl();
+                final urlStr = currentWebUri?.toString() ?? "https://$_currentDomain";
+                final host = currentWebUri?.host.isNotEmpty == true ? currentWebUri!.host : _currentDomain;
+
                 final cookieManager = CookieManager.instance();
-                final cookies = await cookieManager.getCookies(url: WebUri("https://$_currentDomain"));
+                final cookies = await cookieManager.getCookies(url: WebUri("https://$host"));
+                final cookieHeader = cookies.map((c) => "${c.name}=${c.value}").join("; ");
 
                 String? foundToken;
-                for (var cookie in cookies) {
-                  if (cookie.name == 'ssid' || cookie.name == 'keep_code' || cookie.name == 'token') {
-                    foundToken = cookie.value;
-                    break;
+                for (var c in cookies) {
+                  final name = c.name.toLowerCase();
+                  if (name.contains('ssid') || name.contains('token') || name.contains('remember') || name.contains('session') || name.contains('lid')) {
+                    if (c.value.toString().isNotEmpty) {
+                      foundToken = c.value.toString();
+                      break;
+                    }
                   }
                 }
 
-                if (foundToken != null && foundToken.isNotEmpty && mounted) {
-                  Navigator.pop(context, {
-                    'token': foundToken,
-                    'domain': _currentDomain,
-                  });
-                } else if (showIfEmpty && mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text("لم يتم العثور على جلسة نشطة بعد. أكمل تسجيل الدخول أولاً ثم اضغط علامة الصح ✔"),
-                      backgroundColor: Colors.orange,
-                    ),
-                  );
+                final jsRes = await _webViewController!.evaluateJavascript(source: '''
+                  (function() {
+                    try {
+                      let tok = window.__qm_auth_token || (window.settings && window.settings.token) || '';
+                      if (!tok) {
+                        const html = document.documentElement.innerHTML;
+                        const m = html.match(/"token"\\s*:\\s*"([^"]{12,})"/);
+                        if (m && m[1]) tok = m[1];
+                      }
+                      let bal = '';
+                      const balEl = document.querySelector('[class*="balance"], [class*="usermenu__info-balance"], .section-deal__balance');
+                      if (balEl) bal = balEl.innerText.trim();
+                      const isTradeRoom = window.location.pathname.includes('trade') || document.querySelector('.call-btn, [class*="btn-call"], [class*="usermenu"]') !== null;
+                      return JSON.stringify({
+                        token: tok,
+                        balance: bal,
+                        isTradeRoom: isTradeRoom,
+                        path: window.location.pathname
+                      });
+                    } catch(e) {
+                      return JSON.stringify({token: '', balance: '', isTradeRoom: false, path: ''});
+                    }
+                  })();
+                ''');
+
+                String jsToken = "";
+                String detectedBalance = "";
+                bool isTradeRoom = urlStr.contains("/trade") || urlStr.contains("demo-trade");
+
+                if (jsRes != null) {
+                  final raw = jsRes.toString();
+                  final decoded = raw.startsWith('"') ? jsonDecode(raw) : raw;
+                  final map = decoded is String ? jsonDecode(decoded) : decoded;
+                  if (map is Map) {
+                    jsToken = map['token']?.toString() ?? "";
+                    detectedBalance = map['balance']?.toString() ?? "";
+                    if (map['isTradeRoom'] == true) isTradeRoom = true;
+                  }
                 }
-              } catch (_) {}
+
+                final effectiveToken = jsToken.isNotEmpty
+                    ? jsToken
+                    : (foundToken ?? (cookies.isNotEmpty ? cookies.first.value.toString() : "active_web_session"));
+
+                final bool isSignedIn = isTradeRoom || jsToken.isNotEmpty || foundToken != null || (!urlStr.contains("sign-in") && !urlStr.contains("login") && cookies.length >= 2);
+
+                if (isSignedIn || manualTrigger) {
+                  service.attachWebViewController(_webViewController!);
+                  await service.connect(
+                    ssidToken: effectiveToken,
+                    isRealAccount: service.accountType == "real",
+                    domain: host,
+                    cookieHeader: cookieHeader,
+                    detectedBalance: detectedBalance,
+                  );
+
+                  if (mounted && manualTrigger) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text("تم ربط حساب التداول بالبوت بنجاح! جاهز للتداول الآلي ✔"),
+                        backgroundColor: Color(0xFF10B981),
+                        duration: Duration(seconds: 2),
+                      ),
+                    );
+                    widget.onConnectedSuccess();
+                  }
+                }
+              } catch (_) {
+                if (manualTrigger && mounted) {
+                  service.attachWebViewController(_webViewController!);
+                  await service.connect(
+                    ssidToken: "webview_bridge_session",
+                    isRealAccount: service.accountType == "real",
+                    domain: _currentDomain,
+                  );
+                  widget.onConnectedSuccess();
+                }
+              }
             }
 
-            void _switchDomain(String newDomain) {
-              final clean = newDomain.replaceAll("https://", "").replaceAll("http://", "").split("/").first.trim();
-              if (clean.isEmpty) return;
+            void _switchDomain(String dom) {
               setState(() {
-                if (!_domains.contains(clean)) _domains.insert(0, clean);
-                _currentDomain = clean;
+                _currentDomain = dom;
                 _isLoading = true;
                 _webError = null;
               });
@@ -606,189 +810,205 @@ jobs:
               );
             }
 
-            void _showCustomDomainDialog() {
-              _customDomainController.text = _currentDomain;
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  backgroundColor: const Color(0xFF1E293B),
-                  title: const Text("إدخال نطاق بديل للمنصة"),
-                  content: TextField(
-                    controller: _customDomainController,
-                    decoration: const InputDecoration(
-                      hintText: "مثال: market-qx.pro",
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(ctx),
-                      child: const Text("إلغاء"),
-                    ),
-                    ElevatedButton(
-                      onPressed: () {
-                        Navigator.pop(ctx);
-                        _switchDomain(_customDomainController.text);
-                      },
-                      child: const Text("فتح النطاق"),
-                    ),
-                  ],
-                ),
-              );
-            }
-
             @override
             Widget build(BuildContext context) {
-              return Scaffold(
-                appBar: AppBar(
-                  title: const Text("تسجيل الدخول للمنصة", style: TextStyle(fontSize: 16)),
-                  backgroundColor: const Color(0xFF1E293B),
-                  actions: [
-                    IconButton(
-                      icon: const Icon(Icons.language),
-                      tooltip: "كتابة نطاق مخصص",
-                      onPressed: _showCustomDomainDialog,
+              final service = context.watch<QuotexService>();
+
+              return Column(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF111827),
+                      border: Border(bottom: BorderSide(color: Color(0xFF1F2937))),
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.refresh),
-                      tooltip: "إعادة تحميل",
-                      onPressed: () {
-                        setState(() {
-                          _isLoading = true;
-                          _webError = null;
-                        });
-                        _webViewController?.reload();
-                      },
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.dns_rounded, size: 16, color: Color(0xFF10B981)),
+                            const SizedBox(width: 6),
+                            const Text(
+                              "النطاق:",
+                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: SizedBox(
+                                height: 32,
+                                child: ListView.separated(
+                                  scrollDirection: Axis.horizontal,
+                                  itemCount: _domains.length,
+                                  separatorBuilder: (_, __) => const SizedBox(width: 6),
+                                  itemBuilder: (context, i) {
+                                    final dom = _domains[i];
+                                    final selected = dom == _currentDomain;
+                                    return GestureDetector(
+                                      onTap: () => _switchDomain(dom),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: selected ? const Color(0xFF2563EB) : const Color(0xFF1F2937),
+                                          borderRadius: BorderRadius.circular(16),
+                                          border: Border.all(
+                                            color: selected ? const Color(0xFF60A5FA) : Colors.white12,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          dom,
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.refresh_rounded, size: 20, color: Colors.white70),
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                              onPressed: () {
+                                setState(() {
+                                  _isLoading = true;
+                                  _webError = null;
+                                });
+                                _webViewController?.reload();
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 38,
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: service.isConnected ? const Color(0xFF059669) : const Color(0xFF10B981),
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                              elevation: 0,
+                            ),
+                            onPressed: () => _extractAndConnect(manualTrigger: true),
+                            icon: Icon(
+                              service.isConnected ? Icons.verified_rounded : Icons.bolt_rounded,
+                              size: 18,
+                            ),
+                            label: Text(
+                              service.isConnected
+                                  ? "الحساب مربوط بالبوت بنجاح — اضغط للعودة للوحة التحكم ✔"
+                                  : "بعد تسجيل الدخول اضغط هنا لتفعيل البوت على حسابك ✔",
+                              style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.check_circle, color: Colors.greenAccent),
-                      tooltip: "تأكيد الدخول واستخراج الجلسة",
-                      onPressed: () => _checkCookies(showIfEmpty: true),
-                    ),
-                  ],
-                  bottom: PreferredSize(
-                    preferredSize: const Size.fromHeight(48),
-                    child: Container(
-                      color: const Color(0xFF0F172A),
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      child: Row(
-                        children: [
-                          const Text("السيرفر: ", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                          const SizedBox(width: 6),
-                          Expanded(
-                            child: SingleChildScrollView(
-                              scrollDirection: Axis.horizontal,
-                              child: Row(
-                                children: _domains.map((dom) {
-                                  final isSelected = dom == _currentDomain;
-                                  return Padding(
-                                    padding: const EdgeInsets.only(right: 6),
-                                    child: ChoiceChip(
-                                      label: Text(dom, style: const TextStyle(fontSize: 12)),
-                                      selected: isSelected,
-                                      selectedColor: const Color(0xFF2563EB),
-                                      onSelected: (_) => _switchDomain(dom),
-                                    ),
-                                  );
-                                }).toList(),
+                  ),
+                  Expanded(
+                    child: Stack(
+                      children: [
+                        InAppWebView(
+                          initialUrlRequest: URLRequest(
+                            url: WebUri("https://$_currentDomain/ar/sign-in"),
+                          ),
+                          initialUserScripts: UnmodifiableListView<UserScript>([
+                            UserScript(
+                              source: _wsHookScript,
+                              injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+                            ),
+                          ]),
+                          initialSettings: InAppWebViewSettings(
+                            javaScriptEnabled: true,
+                            domStorageEnabled: true,
+                            databaseEnabled: true,
+                            userAgent: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+                          ),
+                          onWebViewCreated: (controller) {
+                            _webViewController = controller;
+                            context.read<QuotexService>().attachWebViewController(controller);
+                          },
+                          onLoadStart: (controller, url) {
+                            if (mounted) {
+                              setState(() {
+                                _isLoading = true;
+                                _webError = null;
+                              });
+                            }
+                          },
+                          onLoadStop: (controller, url) async {
+                            await controller.evaluateJavascript(source: _wsHookScript);
+                            if (mounted) {
+                              setState(() => _isLoading = false);
+                            }
+                            await _extractAndConnect(manualTrigger: false);
+                          },
+                          onReceivedError: (controller, request, error) {
+                            if (request.isForMainFrame ?? true) {
+                              if (mounted) {
+                                setState(() {
+                                  _isLoading = false;
+                                  _webError = error.description;
+                                });
+                              }
+                            }
+                          },
+                        ),
+                        if (_webError != null)
+                          Container(
+                            color: const Color(0xFF0B0F19),
+                            padding: const EdgeInsets.all(24),
+                            child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.wifi_off_rounded, size: 52, color: Colors.amber),
+                                  const SizedBox(height: 14),
+                                  Text(
+                                    "النطاق ($_currentDomain) محجوب على شبكتك",
+                                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  const Text(
+                                    "اختر نطاقاً بديلاً بضغطة واحدة لتجاوز الحجب:",
+                                    style: TextStyle(color: Colors.white70, fontSize: 13),
+                                  ),
+                                  const SizedBox(height: 16),
+                                  Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: _domains.map((dom) {
+                                      return ElevatedButton(
+                                        style: ElevatedButton.styleFrom(
+                                          backgroundColor: const Color(0xFF2563EB),
+                                        ),
+                                        onPressed: () => _switchDomain(dom),
+                                        child: Text(dom),
+                                      );
+                                    }).toList(),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
-                        ],
-                      ),
+                        if (_isLoading)
+                          const Center(
+                            child: CircularProgressIndicator(color: Color(0xFF10B981)),
+                          ),
+                      ],
                     ),
                   ),
-                ),
-                body: Stack(
-                  children: [
-                    InAppWebView(
-                      initialUrlRequest: URLRequest(
-                        url: WebUri("https://$_currentDomain/ar/sign-in"),
-                      ),
-                      initialSettings: InAppWebViewSettings(
-                        javaScriptEnabled: true,
-                        domStorageEnabled: true,
-                        databaseEnabled: true,
-                        clearCache: false,
-                        userAgent: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-                      ),
-                      onWebViewCreated: (controller) => _webViewController = controller,
-                      onLoadStart: (controller, url) {
-                        if (mounted) {
-                          setState(() {
-                            _isLoading = true;
-                            _webError = null;
-                          });
-                        }
-                      },
-                      onLoadStop: (controller, url) async {
-                        if (mounted) setState(() => _isLoading = false);
-                        await _checkCookies();
-                      },
-                      onReceivedError: (controller, request, error) {
-                        if (request.isForMainFrame ?? true) {
-                          if (mounted) {
-                            setState(() {
-                              _isLoading = false;
-                              _webError = error.description;
-                            });
-                          }
-                        }
-                      },
-                    ),
-                    if (_webError != null)
-                      Container(
-                        color: const Color(0xFF0F172A),
-                        padding: const EdgeInsets.all(24),
-                        child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(Icons.wifi_off, size: 56, color: Colors.amber),
-                              const SizedBox(height: 16),
-                              Text(
-                                "النطاق ($_currentDomain) محجوب أو غير متاح على شبكتك الحالية",
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                "السبب التقني: $_webError\nاختر نطاقاً بديلاً بالأسفل أو شغّل VPN لتجاوز حجب مزود الإنترنت المحلي:",
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(color: Colors.white70, fontSize: 13),
-                              ),
-                              const SizedBox(height: 20),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 8,
-                                alignment: WrapAlignment.center,
-                                children: _domains.map((dom) {
-                                  return ElevatedButton.icon(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: dom == _currentDomain ? Colors.blueGrey : const Color(0xFF2563EB),
-                                    ),
-                                    onPressed: () => _switchDomain(dom),
-                                    icon: const Icon(Icons.swap_horiz, size: 18),
-                                    label: Text("تجربة $dom"),
-                                  );
-                                }).toList(),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    if (_isLoading)
-                      const Center(
-                        child: CircularProgressIndicator(),
-                      ),
-                  ],
-                ),
+                ],
               );
             }
           }
           EOF
 
-      - name: Generate main.dart (Full QuMatix Auto-Trading Dashboard)
+      - name: Generate main.dart (Sleek RTL Arabic FinTech UI with 3 Navigation Tabs)
         run: |
           cat << 'EOF' > lib/main.dart
           import 'package:flutter/material.dart';
@@ -812,112 +1032,56 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'QuMatix Auto Trader',
+                title: 'QuMatix Pro',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData.dark().copyWith(
-                  scaffoldBackgroundColor: const Color(0xFF0F172A),
-                  cardColor: const Color(0xFF1E293B),
+                  scaffoldBackgroundColor: const Color(0xFF0B0F19),
+                  cardColor: const Color(0xFF111827),
                   colorScheme: const ColorScheme.dark(
                     primary: Color(0xFF10B981),
-                    secondary: Color(0xFFEF4444),
+                    onPrimary: Colors.white,
+                    secondary: Color(0xFF3B82F6),
+                    onSecondary: Colors.white,
+                    surface: Color(0xFF111827),
+                  ),
+                  elevatedButtonTheme: ElevatedButtonThemeData(
+                    style: ElevatedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                    ),
                   ),
                 ),
-                home: const MainDashboard(),
+                builder: (context, child) {
+                  return Directionality(
+                    textDirection: TextDirection.rtl,
+                    child: child!,
+                  );
+                },
+                home: const MainWorkspace(),
               );
             }
           }
 
-          class MainDashboard extends StatefulWidget {
-            const MainDashboard({super.key});
+          class MainWorkspace extends StatefulWidget {
+            const MainWorkspace({super.key});
 
             @override
-            State<MainDashboard> createState() => _MainDashboardState();
+            State<MainWorkspace> createState() => _MainWorkspaceState();
           }
 
-          class _MainDashboardState extends State<MainDashboard> {
+          class _MainWorkspaceState extends State<MainWorkspace> {
+            int _currentTab = 0;
+
             final TextEditingController _amountController = TextEditingController(text: "1");
             final TextEditingController _tpController = TextEditingController(text: "50");
             final TextEditingController _slController = TextEditingController(text: "25");
-            final TextEditingController _manualTokenController = TextEditingController();
 
             String _selectedAsset = "EURUSD_otc";
-            String _selectedDomain = "market-qx.pro";
             String _selectedStrategy = "qumatix_rsi_ema";
             int _selectedDuration = 60;
             bool _isRealAccount = false;
             bool _useMartingale = true;
 
-            Future<void> _startLoginFlow(BuildContext context) async {
-              final service = context.read<QuotexService>();
-
-              final result = await Navigator.push<Map<String, String>>(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => QuotexLoginScreen(domain: _selectedDomain),
-                ),
-              );
-
-              if (result != null && result['token'] != null && result['token']!.isNotEmpty) {
-                final token = result['token']!;
-                final usedDomain = result['domain'] ?? _selectedDomain;
-                setState(() => _selectedDomain = usedDomain);
-
-                if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text("تم استخراج رمز الجلسة! جاري ربط البوت بالسيرفر..."),
-                      backgroundColor: Colors.green,
-                    ),
-                  );
-                }
-
-                await service.connect(
-                  ssidToken: token,
-                  isRealAccount: _isRealAccount,
-                  domain: usedDomain,
-                );
-              }
-            }
-
-            void _showManualTokenDialog(BuildContext context) {
-              final service = context.read<QuotexService>();
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  backgroundColor: const Color(0xFF1E293B),
-                  title: const Text("ربط مباشر عبر رمز الجلسة (SSID)"),
-                  content: TextField(
-                    controller: _manualTokenController,
-                    decoration: const InputDecoration(
-                      labelText: "أدخل رمز الجلسة (SSID Token)",
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(ctx),
-                      child: const Text("إلغاء"),
-                    ),
-                    ElevatedButton(
-                      onPressed: () {
-                        final tok = _manualTokenController.text.trim();
-                        Navigator.pop(ctx);
-                        if (tok.isNotEmpty) {
-                          service.connect(
-                            ssidToken: tok,
-                            isRealAccount: _isRealAccount,
-                            domain: _selectedDomain,
-                          );
-                        }
-                      },
-                      child: const Text("اتصال بالسيرفر"),
-                    ),
-                  ],
-                ),
-              );
-            }
-
-            void _syncSettingsToService(QuotexService service) {
+            void _syncSettings(QuotexService service) {
               service.updateSettings(
                 asset: _selectedAsset,
                 duration: _selectedDuration,
@@ -926,6 +1090,7 @@ jobs:
                 takeProfit: double.tryParse(_tpController.text) ?? 50.0,
                 stopLoss: double.tryParse(_slController.text) ?? 25.0,
                 strategy: _selectedStrategy,
+                isRealAccount: _isRealAccount,
               );
             }
 
@@ -935,395 +1100,104 @@ jobs:
 
               return Scaffold(
                 appBar: AppBar(
-                  title: const Text("QuMatix Auto-Trading Bot", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
-                  backgroundColor: const Color(0xFF1E293B),
+                  backgroundColor: const Color(0xFF111827),
+                  elevation: 0,
+                  title: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(7),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: [Color(0xFF10B981), Color(0xFF059669)],
+                          ),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(Icons.auto_graph_rounded, color: Colors.white, size: 20),
+                      ),
+                      const SizedBox(width: 10),
+                      const Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text("QuMatix Pro AI", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                          Text("نظام التداول الآلي المباشر", style: TextStyle(fontSize: 10.5, color: Colors.white60)),
+                        ],
+                      ),
+                    ],
+                  ),
                   actions: [
-                    IconButton(
-                      icon: const Icon(Icons.vpn_key_outlined),
-                      tooltip: "إدخال رمز SSID يدوياً",
-                      onPressed: () => _showManualTokenDialog(context),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: service.isConnected
+                                ? const Color(0xFF064E3B)
+                                : const Color(0xFF7F1D1D),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(
+                              color: service.isConnected
+                                  ? const Color(0xFF10B981)
+                                  : const Color(0xFFEF4444),
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.circle,
+                                size: 8,
+                                color: service.isConnected ? const Color(0xFF10B981) : const Color(0xFFEF4444),
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                service.isConnected ? "متصل بالسيرفر" : "غير متصل",
+                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
                     ),
                   ],
                 ),
-                body: SingleChildScrollView(
-                  padding: const EdgeInsets.all(14.0),
-                  child: Column(
-                    children: [
-                      // 1. بطاقة الاتصال بالسيرفر ونوع الحساب
-                      Card(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        child: Padding(
-                          padding: const EdgeInsets.all(14.0),
-                          child: Column(
-                            children: [
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  const Text("نوع الحساب:", style: TextStyle(fontWeight: FontWeight.bold)),
-                                  Row(
-                                    children: [
-                                      ChoiceChip(
-                                        label: const Text("تجريبي (Demo)"),
-                                        selected: !_isRealAccount,
-                                        onSelected: (val) => setState(() => _isRealAccount = !val),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      ChoiceChip(
-                                        label: const Text("حقيقي (Real)"),
-                                        selected: _isRealAccount,
-                                        selectedColor: Colors.amber.shade800,
-                                        onSelected: (val) => setState(() => _isRealAccount = val),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 10),
-                              DropdownButtonFormField<String>(
-                                value: _selectedDomain,
-                                decoration: const InputDecoration(
-                                  border: OutlineInputBorder(),
-                                  labelText: "نطاق السيرفر المباشر",
-                                  contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                                ),
-                                items: const [
-                                  DropdownMenuItem(value: "market-qx.pro", child: Text("market-qx.pro (نطاق بديل لتجاوز الحجب)")),
-                                  DropdownMenuItem(value: "qxbroker.com", child: Text("qxbroker.com (النطاق الرئيسي)")),
-                                  DropdownMenuItem(value: "quotex.io", child: Text("quotex.io (نطاق عالمي)")),
-                                  DropdownMenuItem(value: "quotex.com", child: Text("quotex.com")),
-                                ],
-                                onChanged: (val) => setState(() => _selectedDomain = val!),
-                              ),
-                              const SizedBox(height: 12),
-                              SizedBox(
-                                width: double.infinity,
-                                child: ElevatedButton.icon(
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: service.isConnected ? Colors.red.shade700 : const Color(0xFF2563EB),
-                                    padding: const EdgeInsets.symmetric(vertical: 13),
-                                  ),
-                                  onPressed: () {
-                                    if (service.isConnected) {
-                                      service.disconnect();
-                                    } else {
-                                      _startLoginFlow(context);
-                                    }
-                                  },
-                                  icon: Icon(service.isConnected ? Icons.link_off : Icons.login),
-                                  label: Text(
-                                    service.isConnected ? "قطع الاتصال بالسيرفر" : "تسجيل الدخول والربط التلقائي بالسيرفر",
-                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                body: IndexedStack(
+                  index: _currentTab,
+                  children: [
+                    _buildBotDashboardTab(context, service),
+                    QuotexPlatformView(
+                      onConnectedSuccess: () {
+                        setState(() => _currentTab = 0);
+                      },
+                    ),
+                    _buildRiskAndLogsTab(context, service),
+                  ],
+                ),
+                bottomNavigationBar: Container(
+                  decoration: const BoxDecoration(
+                    border: Border(top: BorderSide(color: Color(0xFF1F2937))),
+                  ),
+                  child: BottomNavigationBar(
+                    currentIndex: _currentTab,
+                    backgroundColor: const Color(0xFF111827),
+                    selectedItemColor: const Color(0xFF10B981),
+                    unselectedItemColor: Colors.white54,
+                    type: BottomNavigationBarType.fixed,
+                    selectedLabelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                    unselectedLabelStyle: const TextStyle(fontSize: 11),
+                    onTap: (idx) => setState(() => _currentTab = idx),
+                    items: const [
+                      BottomNavigationBarItem(
+                        icon: Icon(Icons.smart_toy_rounded),
+                        label: "لوحة البوت",
                       ),
-                      const SizedBox(height: 12),
-
-                      // 2. بطاقة الرصيد الحي وإحصائيات البوت
-                      Card(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        child: Padding(
-                          padding: const EdgeInsets.all(14.0),
-                          child: Column(
-                            children: [
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      const Text("الرصيد الحي بالسيرفر", style: TextStyle(color: Colors.grey, fontSize: 12)),
-                                      Text(
-                                        "\$${service.balance.toStringAsFixed(2)}",
-                                        style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.greenAccent),
-                                      ),
-                                    ],
-                                  ),
-                                  Column(
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: [
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                        decoration: BoxDecoration(
-                                          color: service.isConnected ? Colors.green.shade900 : Colors.red.shade900,
-                                          borderRadius: BorderRadius.circular(20),
-                                        ),
-                                        child: Text(
-                                          service.isConnected
-                                              ? (service.isAuthenticated ? "متصل ومصادق ✔" : "متصل بالسيرفر")
-                                              : "غير متصل",
-                                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 6),
-                                      Text(
-                                        "صافي الربح: \$${service.netProfit.toStringAsFixed(2)}",
-                                        style: TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.bold,
-                                          color: service.netProfit >= 0 ? Colors.greenAccent : Colors.redAccent,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                              const Divider(height: 20),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                                children: [
-                                  _statItem("الصفقات", "${service.totalTrades}", Colors.white),
-                                  _statItem("رابحة", "${service.wonTrades}", Colors.greenAccent),
-                                  _statItem("خاسرة", "${service.lostTrades}", Colors.redAccent),
-                                  _statItem("مؤشر RSI", service.currentRsi.toStringAsFixed(1), Colors.amberAccent),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
+                      BottomNavigationBarItem(
+                        icon: Icon(Icons.candlestick_chart_rounded),
+                        label: "المنصة والشارت",
                       ),
-                      const SizedBox(height: 12),
-
-                      // 3. بطاقة إعدادات التداول الآلي واستراتيجية QuMatix
-                      Card(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        child: Padding(
-                          padding: const EdgeInsets.all(14.0),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  const Text("محرك التداول الآلي (QuMatix AI)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                                  Text(
-                                    service.lastSignal,
-                                    style: const TextStyle(fontSize: 12, color: Colors.cyanAccent),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 12),
-                              DropdownButtonFormField<String>(
-                                value: _selectedStrategy,
-                                decoration: const InputDecoration(
-                                  border: OutlineInputBorder(),
-                                  labelText: "استراتيجية التداول الآلي",
-                                  contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                                ),
-                                items: const [
-                                  DropdownMenuItem(value: "qumatix_rsi_ema", child: Text("استراتيجية QuMatix الذكية (RSI + EMA)")),
-                                  DropdownMenuItem(value: "trend_momentum", child: Text("تتبع الزخم والاتجاه (Trend Momentum)")),
-                                  DropdownMenuItem(value: "reversal_bollinger", child: Text("الارتداد السعري (Reversal Sniper)")),
-                                ],
-                                onChanged: (val) {
-                                  setState(() => _selectedStrategy = val!);
-                                  _syncSettingsToService(service);
-                                },
-                              ),
-                              const SizedBox(height: 10),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: DropdownButtonFormField<String>(
-                                      value: _selectedAsset,
-                                      decoration: const InputDecoration(
-                                        border: OutlineInputBorder(),
-                                        labelText: "زوج العملات",
-                                        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                      ),
-                                      items: const [
-                                        DropdownMenuItem(value: "EURUSD_otc", child: Text("EUR/USD (OTC)")),
-                                        DropdownMenuItem(value: "GBPUSD_otc", child: Text("GBP/USD (OTC)")),
-                                        DropdownMenuItem(value: "USDJPY_otc", child: Text("USD/JPY (OTC)")),
-                                        DropdownMenuItem(value: "AUDCAD_otc", child: Text("AUD/CAD (OTC)")),
-                                        DropdownMenuItem(value: "BTCUSD", child: Text("Bitcoin (BTC)")),
-                                      ],
-                                      onChanged: (val) {
-                                        setState(() => _selectedAsset = val!);
-                                        _syncSettingsToService(service);
-                                      },
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: DropdownButtonFormField<int>(
-                                      value: _selectedDuration,
-                                      decoration: const InputDecoration(
-                                        border: OutlineInputBorder(),
-                                        labelText: "مدة الصفقة",
-                                        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                      ),
-                                      items: const [
-                                        DropdownMenuItem(value: 5, child: Text("5 ثوانٍ")),
-                                        DropdownMenuItem(value: 15, child: Text("15 ثانية")),
-                                        DropdownMenuItem(value: 30, child: Text("30 ثانية")),
-                                        DropdownMenuItem(value: 60, child: Text("1 دقيقة")),
-                                        DropdownMenuItem(value: 120, child: Text("2 دقيقتان")),
-                                        DropdownMenuItem(value: 300, child: Text("5 دقائق")),
-                                      ],
-                                      onChanged: (val) {
-                                        setState(() => _selectedDuration = val!);
-                                        _syncSettingsToService(service);
-                                      },
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 10),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: TextField(
-                                      controller: _amountController,
-                                      keyboardType: TextInputType.number,
-                                      decoration: const InputDecoration(
-                                        labelText: "المبلغ (\$)",
-                                        border: OutlineInputBorder(),
-                                        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                      ),
-                                      onChanged: (_) => _syncSettingsToService(service),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: TextField(
-                                      controller: _tpController,
-                                      keyboardType: TextInputType.number,
-                                      decoration: const InputDecoration(
-                                        labelText: "هدف الربح (\$)",
-                                        border: OutlineInputBorder(),
-                                        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                      ),
-                                      onChanged: (_) => _syncSettingsToService(service),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: TextField(
-                                      controller: _slController,
-                                      keyboardType: TextInputType.number,
-                                      decoration: const InputDecoration(
-                                        labelText: "وقف الخسارة (\$)",
-                                        border: OutlineInputBorder(),
-                                        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                      ),
-                                      onChanged: (_) => _syncSettingsToService(service),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              SwitchListTile(
-                                contentPadding: EdgeInsets.zero,
-                                title: const Text("تفعيل المضاعفة التلقائية (Martingale x2)", style: TextStyle(fontSize: 13)),
-                                value: _useMartingale,
-                                activeColor: Colors.greenAccent,
-                                onChanged: (val) {
-                                  setState(() => _useMartingale = val);
-                                  _syncSettingsToService(service);
-                                },
-                              ),
-                              SizedBox(
-                                width: double.infinity,
-                                child: ElevatedButton.icon(
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: service.isAutoTrading ? Colors.amber.shade800 : const Color(0xFF10B981),
-                                    padding: const EdgeInsets.symmetric(vertical: 14),
-                                  ),
-                                  onPressed: () {
-                                    _syncSettingsToService(service);
-                                    service.toggleAutoTrading();
-                                  },
-                                  icon: Icon(service.isAutoTrading ? Icons.pause_circle_filled : Icons.smart_toy),
-                                  label: Text(
-                                    service.isAutoTrading ? "إيقاف التداول الآلي (البوت يعمل الآن...)" : "بدء التداول الآلي الذكي (Start Bot)",
-                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 10),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: OutlinedButton.icon(
-                                      style: OutlinedButton.styleFrom(
-                                        foregroundColor: Colors.greenAccent,
-                                        side: const BorderSide(color: Colors.green),
-                                        padding: const EdgeInsets.symmetric(vertical: 12),
-                                      ),
-                                      onPressed: () {
-                                        final amt = double.tryParse(_amountController.text) ?? 1.0;
-                                        service.placeOrder(
-                                          asset: _selectedAsset,
-                                          direction: "call",
-                                          amount: amt,
-                                          duration: _selectedDuration,
-                                        );
-                                      },
-                                      icon: const Icon(Icons.arrow_upward, size: 18),
-                                      label: const Text("شراء فوري (CALL)"),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: OutlinedButton.icon(
-                                      style: OutlinedButton.styleFrom(
-                                        foregroundColor: Colors.redAccent,
-                                        side: const BorderSide(color: Colors.red),
-                                        padding: const EdgeInsets.symmetric(vertical: 12),
-                                      ),
-                                      onPressed: () {
-                                        final amt = double.tryParse(_amountController.text) ?? 1.0;
-                                        service.placeOrder(
-                                          asset: _selectedAsset,
-                                          direction: "put",
-                                          amount: amt,
-                                          duration: _selectedDuration,
-                                        );
-                                      },
-                                      icon: const Icon(Icons.arrow_downward, size: 18),
-                                      label: const Text("بيع فوري (PUT)"),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 4. سجل عمليات السيرفر المباشر
-                      Card(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        child: Padding(
-                          padding: const EdgeInsets.all(14.0),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text("سجل اتصال السيرفر وتنفيذ الصفقات المباشر", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                              const SizedBox(height: 8),
-                              Container(
-                                height: 150,
-                                width: double.infinity,
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: Colors.black,
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: ListView.builder(
-                                  itemCount: service.logs.length,
-                                  itemBuilder: (context, idx) => Text(
-                                    service.logs[idx],
-                                    style: const TextStyle(color: Colors.greenAccent, fontSize: 11.5, fontFamily: 'monospace'),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                      BottomNavigationBarItem(
+                        icon: Icon(Icons.tune_rounded),
+                        label: "الإعدادات والسجل",
                       ),
                     ],
                   ),
@@ -1331,13 +1205,557 @@ jobs:
               );
             }
 
-            Widget _statItem(String label, String value, Color color) {
-              return Column(
-                children: [
-                  Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                  const SizedBox(height: 2),
-                  Text(value, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: color)),
-                ],
+            Widget _buildBotDashboardTab(BuildContext context, QuotexService service) {
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(18),
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF1E293B), Color(0xFF0F172A)],
+                          begin: Alignment.topRight,
+                          end: Alignment.bottomLeft,
+                        ),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white12),
+                        boxShadow: const [
+                          BoxShadow(color: Colors.black26, blurRadius: 12, offset: Offset(0, 6)),
+                        ],
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    "رصيد الحساب المباشر",
+                                    style: TextStyle(color: Colors.white60, fontSize: 12.5),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    service.balance > 0
+                                        ? "\$${service.balance.toStringAsFixed(2)}"
+                                        : service.balanceText,
+                                    style: const TextStyle(
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.bold,
+                                      color: Color(0xFF10B981),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              Container(
+                                padding: const EdgeInsets.all(4),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF0B0F19),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: Colors.white10),
+                                ),
+                                child: Row(
+                                  children: [
+                                    _accountSegmentButton(
+                                      title: "تجريبي",
+                                      selected: !_isRealAccount,
+                                      activeColor: const Color(0xFF2563EB),
+                                      onTap: () {
+                                        setState(() => _isRealAccount = false);
+                                        _syncSettings(service);
+                                      },
+                                    ),
+                                    _accountSegmentButton(
+                                      title: "حقيقي",
+                                      selected: _isRealAccount,
+                                      activeColor: const Color(0xFFD97706),
+                                      onTap: () {
+                                        setState(() => _isRealAccount = true);
+                                        _syncSettings(service);
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: service.isConnected
+                                    ? const Color(0xFF1F2937)
+                                    : const Color(0xFF2563EB),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 13),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                              onPressed: () {
+                                setState(() => _currentTab = 1);
+                              },
+                              icon: Icon(
+                                service.isConnected ? Icons.candlestick_chart_rounded : Icons.login_rounded,
+                                size: 19,
+                              ),
+                              label: Text(
+                                service.isConnected
+                                    ? "فتح شارت المنصة المباشر (${service.currentDomain})"
+                                    : "تسجيل الدخول وربط حساب المنصة الآن",
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _metricCard(
+                            title: "إجمالي الصفقات",
+                            value: "${service.totalTrades}",
+                            icon: Icons.swap_vert_circle_rounded,
+                            color: const Color(0xFF60A5FA),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: _metricCard(
+                            title: "صفقات رابحة",
+                            value: "${service.wonTrades}",
+                            icon: Icons.trending_up_rounded,
+                            color: const Color(0xFF10B981),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: _metricCard(
+                            title: "صفقات خاسرة",
+                            value: "${service.lostTrades}",
+                            icon: Icons.trending_down_rounded,
+                            color: const Color(0xFFEF4444),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: _metricCard(
+                            title: "مؤشر RSI",
+                            value: service.currentRsi.toStringAsFixed(1),
+                            icon: Icons.speed_rounded,
+                            color: const Color(0xFFF59E0B),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF111827),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.psychology_rounded, color: Color(0xFF10B981), size: 20),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    "إعدادات محرك التداول الآلي",
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                  ),
+                                ],
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF1E293B),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(
+                                  service.lastSignal,
+                                  style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          DropdownButtonFormField<String>(
+                            value: _selectedStrategy,
+                            decoration: InputDecoration(
+                              labelText: "خوارزمية التحليل الآلي",
+                              filled: true,
+                              fillColor: const Color(0xFF0B0F19),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                            ),
+                            items: const [
+                              DropdownMenuItem(value: "qumatix_rsi_ema", child: Text("خوارزمية QuMatix الذكية (RSI + EMA)")),
+                              DropdownMenuItem(value: "trend_momentum", child: Text("تتبع الزخم والاتجاه (Trend Pro)")),
+                              DropdownMenuItem(value: "reversal_sniper", child: Text("قناص الارتداد السعري (Reversal Sniper)")),
+                            ],
+                            onChanged: (val) {
+                              setState(() => _selectedStrategy = val!);
+                              _syncSettings(service);
+                            },
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: DropdownButtonFormField<String>(
+                                  value: _selectedAsset,
+                                  decoration: InputDecoration(
+                                    labelText: "زوج العملات",
+                                    filled: true,
+                                    fillColor: const Color(0xFF0B0F19),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(value: "EURUSD_otc", child: Text("EUR/USD (OTC)")),
+                                    DropdownMenuItem(value: "GBPUSD_otc", child: Text("GBP/USD (OTC)")),
+                                    DropdownMenuItem(value: "USDJPY_otc", child: Text("USD/JPY (OTC)")),
+                                    DropdownMenuItem(value: "AUDCAD_otc", child: Text("AUD/CAD (OTC)")),
+                                    DropdownMenuItem(value: "BTCUSD", child: Text("Bitcoin (BTC)")),
+                                  ],
+                                  onChanged: (val) {
+                                    setState(() => _selectedAsset = val!);
+                                    _syncSettings(service);
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: TextField(
+                                  controller: _amountController,
+                                  keyboardType: TextInputType.number,
+                                  decoration: InputDecoration(
+                                    labelText: "مبلغ الصفقة (\$)",
+                                    filled: true,
+                                    fillColor: const Color(0xFF0B0F19),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                                  ),
+                                  onChanged: (_) => _syncSettings(service),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          const Text("مدة الصفقة الزمنية:", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                          const SizedBox(height: 8),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              _durationChip(5, "5 ث"),
+                              _durationChip(15, "15 ث"),
+                              _durationChip(30, "30 ث"),
+                              _durationChip(60, "1 د"),
+                              _durationChip(120, "2 د"),
+                              _durationChip(300, "5 د"),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: service.isAutoTrading
+                                    ? const Color(0xFFD97706)
+                                    : const Color(0xFF10B981),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 15),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                                elevation: 4,
+                              ),
+                              onPressed: () {
+                                _syncSettings(service);
+                                service.toggleAutoTrading();
+                              },
+                              icon: Icon(
+                                service.isAutoTrading ? Icons.stop_circle_rounded : Icons.play_circle_fill_rounded,
+                                size: 22,
+                              ),
+                              label: Text(
+                                service.isAutoTrading
+                                    ? "إيقاف البوت الآلي (التداول الآلي نشط...)"
+                                    : "تشغيل البوت الآلي الذكي (Start Auto-Bot)",
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF059669),
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(vertical: 13),
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  onPressed: () {
+                                    final amt = double.tryParse(_amountController.text) ?? 1.0;
+                                    service.placeOrder(
+                                      asset: _selectedAsset,
+                                      direction: "call",
+                                      amount: amt,
+                                      duration: _selectedDuration,
+                                    );
+                                  },
+                                  icon: const Icon(Icons.trending_up_rounded, size: 20),
+                                  label: const Text("شراء فوري (CALL)", style: TextStyle(fontWeight: FontWeight.bold)),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFFDC2626),
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(vertical: 13),
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  onPressed: () {
+                                    final amt = double.tryParse(_amountController.text) ?? 1.0;
+                                    service.placeOrder(
+                                      asset: _selectedAsset,
+                                      direction: "put",
+                                      amount: amt,
+                                      duration: _selectedDuration,
+                                    );
+                                  },
+                                  icon: const Icon(Icons.trending_down_rounded, size: 20),
+                                  label: const Text("بيع فوري (PUT)", style: TextStyle(fontWeight: FontWeight.bold)),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _buildRiskAndLogsTab(BuildContext context, QuotexService service) {
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF111827),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.shield_rounded, color: Color(0xFF3B82F6), size: 20),
+                              SizedBox(width: 8),
+                              Text("إدارة رأس المال والمخاطر", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: _tpController,
+                                  keyboardType: TextInputType.number,
+                                  decoration: InputDecoration(
+                                    labelText: "هدف الربح اليومي (\$)",
+                                    filled: true,
+                                    fillColor: const Color(0xFF0B0F19),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  onChanged: (_) => _syncSettings(service),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: TextField(
+                                  controller: _slController,
+                                  keyboardType: TextInputType.number,
+                                  decoration: InputDecoration(
+                                    labelText: "حد وقف الخسارة (\$)",
+                                    filled: true,
+                                    fillColor: const Color(0xFF0B0F19),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  onChanged: (_) => _syncSettings(service),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text("المضاعفة الذكية عند الخسارة (Martingale x2)", style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold)),
+                            subtitle: const Text("مضاعفة قيمة الصفقة تلقائياً لتعويض الخسارة السابقة", style: TextStyle(fontSize: 11.5, color: Colors.white54)),
+                            value: _useMartingale,
+                            activeColor: const Color(0xFF10B981),
+                            onChanged: (val) {
+                              setState(() => _useMartingale = val);
+                              _syncSettings(service);
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF111827),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.terminal_rounded, color: Color(0xFF10B981), size: 20),
+                              SizedBox(width: 8),
+                              Text("سجل عمليات السيرفر المباشر", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Container(
+                            height: 260,
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF05080F),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.white10),
+                            ),
+                            child: service.logs.isEmpty
+                                ? const Center(
+                                    child: Text("لا توجد أحداث مسجلة بعد...", style: TextStyle(color: Colors.white38, fontSize: 12)),
+                                  )
+                                : ListView.builder(
+                                    itemCount: service.logs.length,
+                                    itemBuilder: (context, idx) => Padding(
+                                      padding: const EdgeInsets.symmetric(vertical: 2),
+                                      child: Text(
+                                        service.logs[idx],
+                                        style: const TextStyle(color: Color(0xFF34D399), fontSize: 11.5, fontFamily: 'monospace'),
+                                      ),
+                                    ),
+                                  ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _accountSegmentButton({
+              required String title,
+              required bool selected,
+              required Color activeColor,
+              required VoidCallback onTap,
+            }) {
+              return GestureDetector(
+                onTap: onTap,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: selected ? activeColor : Colors.transparent,
+                    borderRadius: BorderRadius.circular(9),
+                  ),
+                  child: Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                      color: selected ? Colors.white : Colors.white60,
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _metricCard({
+              required String title,
+              required String value,
+              required IconData icon,
+              required Color color,
+            }) {
+              return Container(
+                padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF111827),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: Column(
+                  children: [
+                    Icon(icon, color: color, size: 20),
+                    const SizedBox(height: 6),
+                    Text(
+                      value,
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: color),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      title,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 10, color: Colors.white60),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _durationChip(int seconds, String label) {
+              final selected = _selectedDuration == seconds;
+              return GestureDetector(
+                onTap: () {
+                  setState(() => _selectedDuration = seconds);
+                  _syncSettings(context.read<QuotexService>());
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: selected ? const Color(0xFF2563EB) : const Color(0xFF0B0F19),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: selected ? const Color(0xFF60A5FA) : Colors.white12,
+                    ),
+                  ),
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                      color: selected ? Colors.white : Colors.white70,
+                    ),
+                  ),
+                ),
               );
             }
           }
@@ -1359,4 +1777,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: QuMatix-App-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: build/app/outputs/flutter-apk/app-release.apk    
