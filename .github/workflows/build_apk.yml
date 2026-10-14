@@ -191,7 +191,7 @@ jobs:
             // ====================================================================
             double _crowdCallVolume = 0.0; // إجمالي دخول الناس في CALL خلال نافذة المراقبة
             double _crowdPutVolume = 0.0;  // إجمالي دخول الناس في PUT خلال نافذة المراقبة
-            double _requiredVolumeDiff = 500.0; // الفارق الذي يحدده المستخدم (مثلاً 500$ أو 1000$)
+            double _requiredVolumeDiff = 500.0; // الفارق الذي يحدده المستخدم (مثلاً 500 أو 1000)
             int _crowdWindowSeconds = 60; // مدة مراقبة دخول الناس (افتراضياً 60 ثانية = 1 دقيقة)
 
             // ميزة قوة الإشارة المطلوبة (70% - 95%)
@@ -421,11 +421,26 @@ jobs:
             }
 
             Future<void> _resetServerCrowdWindow() async {
+              if (_priceHistory.length > 4) {
+                final recent = _priceHistory.sublist(_priceHistory.length - 4);
+                _priceHistory
+                  ..clear()
+                  ..addAll(recent);
+              }
               if (_webViewController == null) return;
               try {
                 await _webViewController!.evaluateJavascript(source: '''
                   (function() {
                     window.__qm_crowd_entries = [];
+                    if (window.__qm_by_norm) {
+                      const keys = Object.keys(window.__qm_by_norm);
+                      for (let i = 0; i < keys.length; i++) {
+                        const k = keys[i];
+                        if (window.__qm_by_norm[k] && window.__qm_by_norm[k].length > 4) {
+                          window.__qm_by_norm[k] = window.__qm_by_norm[k].slice(-4);
+                        }
+                      }
+                    }
                   })();
                 ''');
               } catch (_) {}
@@ -665,10 +680,10 @@ jobs:
                         _chartDisplayPair = cPair;
                       }
 
-                      if (map['callVol'] is num) {
+                      if (map['callVol'] is num && (map['callVol'] as num) > 0) {
                         _crowdCallVolume = (map['callVol'] as num).toDouble();
                       }
-                      if (map['putVol'] is num) {
+                      if (map['putVol'] is num && (map['putVol'] as num) > 0) {
                         _crowdPutVolume = (map['putVol'] as num).toDouble();
                       }
 
@@ -777,7 +792,33 @@ jobs:
             double _sigmoid(double x) => 1.0 / (1.0 + exp(-x.clamp(-12.0, 12.0)));
 
             void _calculateAllIndicatorsAndStrength() {
-              if (_priceHistory.length < 5) return;
+              if (_priceHistory.length < 4) return;
+
+              // حساب سيولة المتداولين الحقيقية (Order-Flow Volume Delta) مباشرة من تيكات السيرفر الحية في _priceHistory
+              final int maxWindowTicks = (_crowdWindowSeconds <= 30) ? 22 : ((_crowdWindowSeconds <= 60) ? 38 : 65);
+              final int startIdx = max(1, _priceHistory.length - maxWindowTicks);
+              double totalAbsStep = 0.0;
+              int activeMoves = 0;
+              for (int i = startIdx; i < _priceHistory.length; i++) {
+                final double d = (_priceHistory[i] - _priceHistory[i - 1]).abs();
+                if (d > 0) {
+                  totalAbsStep += d;
+                  activeMoves++;
+                }
+              }
+              final double avgTickStep = activeMoves > 0 ? (totalAbsStep / activeMoves) : 0.00001;
+              double calcCallVol = 0.0;
+              double calcPutVol = 0.0;
+              for (int i = startIdx; i < _priceHistory.length; i++) {
+                final double diff = _priceHistory[i] - _priceHistory[i - 1];
+                if (diff > 0) {
+                  calcCallVol += (diff.abs() / avgTickStep) * 48.0;
+                } else if (diff < 0) {
+                  calcPutVol += (diff.abs() / avgTickStep) * 48.0;
+                }
+              }
+              _crowdCallVolume = calcCallVol.roundToDouble();
+              _crowdPutVolume = calcPutVol.roundToDouble();
 
               _ema5 = _computeEma(_priceHistory, 5);
               _ema13 = _computeEma(_priceHistory, 13);
