@@ -298,7 +298,7 @@ jobs:
                   final res = await _webViewController!.evaluateJavascript(source: '''
                     (function() {
                       try {
-                        // 1. استخراج الرصيد الحقيقي الظاهر أعلى المنصة (مثل $142.97)
+                        // 1. استخراج الرصيد الحقيقي الظاهر أعلى المنصة
                         let foundBalance = '';
                         if (window.__qm_ws_balance !== null && window.__qm_ws_balance !== undefined) {
                           foundBalance = String(window.__qm_ws_balance);
@@ -309,7 +309,7 @@ jobs:
                             const el = allEls[i];
                             if (el.children.length === 0 && el.innerText) {
                               const t = el.innerText.trim();
-                              if (/^[\\$€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?$/.test(t) || /^[0-9,]+\\.[0-9]{2}\\s*[\\$€£৳₹¥]$/.test(t)) {
+                              if (/[\x24€£৳₹¥]\s*[0-9,]+(\.[0-9]{1,2})?/.test(t) || /[0-9,]+\.[0-9]{2}\s*[\x24€£৳₹¥]/.test(t)) {
                                 foundBalance = t;
                                 break;
                               }
@@ -324,7 +324,7 @@ jobs:
                             if (el.children.length <= 1 && el.innerText) {
                               const rect = el.getBoundingClientRect();
                               if (rect.top >= 0 && rect.top < 140 && rect.width > 10) {
-                                const m = el.innerText.match(/[\\$€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?/);
+                                const m = el.innerText.match(/[\x24€£৳₹¥]\s*[0-9,]+(\.[0-9]{1,2})?/);
                                 if (m && m[0]) {
                                   foundBalance = m[0];
                                   break;
@@ -952,7 +952,7 @@ jobs:
                           if (el.children.length <= 1 && el.innerText) {
                             const rect = el.getBoundingClientRect();
                             if (rect.top >= 0 && rect.top < 140 && rect.width > 10) {
-                              const m = el.innerText.match(/[\\$€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?/);
+                              const m = el.innerText.match(/[\x24€£৳₹¥]\s*[0-9,]+(\.[0-9]{1,2})?/);
                               if (m && m[0]) {
                                 bal = m[0];
                                 break;
