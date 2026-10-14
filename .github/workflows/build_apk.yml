@@ -38,9 +38,9 @@ jobs:
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Pro AI v4.0 Real Execution Engine"
+          description: "QuMatix Pro AI v4.1 Real Execution Engine"
           publish_to: 'none'
-          version: 4.0.0+6
+          version: 4.1.0+7
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -320,7 +320,6 @@ jobs:
                   final res = await _webViewController!.evaluateJavascript(source: '''
                     (function() {
                       try {
-                        // 1. قراءة الرصيد الظاهر أعلى المنصة
                         let foundBalance = '';
                         const topNodes = document.querySelectorAll('header *, [class*="usermenu"] *, div, span, b');
                         for (let i = 0; i < topNodes.length; i++) {
@@ -328,7 +327,7 @@ jobs:
                           if (el.children.length === 0 && el.innerText) {
                             const rect = el.getBoundingClientRect();
                             if (rect.top >= 0 && rect.top < 130 && rect.width > 10) {
-                              const m = el.innerText.trim().match(/^[\\x24€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?\\$/);
+                              const m = el.innerText.trim().match(/[\\x24€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?/);
                               if (m && m[0]) {
                                 foundBalance = m[0];
                                 break;
@@ -337,21 +336,19 @@ jobs:
                           }
                         }
 
-                        // 2. قراءة اسم الزوج المفتوح فعلياً في الشارت (مثل USD/BRL (OTC))
                         let chartPair = '';
                         const dealNodes = document.querySelectorAll('[class*="pair"], [class*="asset"], [class*="section-deal"] *, span, div');
                         for (let i = 0; i < dealNodes.length; i++) {
                           const el = dealNodes[i];
                           if (el.children.length === 0 && el.innerText) {
                             const txt = el.innerText.trim();
-                            if (/^[A-Z]{3}\\/[A-Z]{3}(\\s*\\(OTC\\))?\\$/.test(txt) || /^[A-Za-z0-9]+\\s*\\(OTC\\\)\\$/.test(txt)) {
+                            if ((txt.length >= 7 && txt.length <= 18 && txt.indexOf('/') === 3) || txt.endsWith('(OTC)')) {
                               chartPair = txt;
                               break;
                             }
                           }
                         }
 
-                        // 3. جلب أسعار هذا الزوج تحديداً دون خلطها بأزواج أخرى
                         function norm(s) {
                           return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
                         }
@@ -407,7 +404,6 @@ jobs:
                         }
                       }
 
-                      // فحص فوري لهدف الربح ووقف الخسارة أثناء عمل البوت
                       if (_isAutoTrading && _initialSessionBalance > 0) {
                         if (netProfit >= _takeProfitTarget) {
                           stopAutoTrading(reason: "🎯 تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
@@ -442,7 +438,6 @@ jobs:
               _emaSlow = _computeEma(_priceHistory, 14);
               _priceMomentum = _priceHistory.last - _priceHistory[max(0, _priceHistory.length - 4)];
 
-              // حساب قنوات بولينجر (Bollinger Bands)
               final double mean = _priceHistory.reduce((a, b) => a + b) / _priceHistory.length;
               double sumSq = 0.0;
               for (final p in _priceHistory) {
@@ -452,7 +447,6 @@ jobs:
               _bollingerUpper = mean + (1.6 * stdDev);
               _bollingerLower = mean - (1.6 * stdDev);
 
-              // حساب مؤشر RSI الحقيقي
               final int window = min(14, _priceHistory.length - 1);
               double gains = 0.0;
               double losses = 0.0;
@@ -576,7 +570,6 @@ jobs:
                 }
                 _lastSignal = "Trend Pro: ${direction.toUpperCase()} (${_priceMomentum >= 0 ? 'صاعد ↗' : 'هابط ↘'})";
               } else {
-                // قناص الارتداد السعري (Bollinger Bands + RSI)
                 if (price <= _bollingerLower || _currentRsi <= 42.0) {
                   direction = "call";
                   reason = "[Sniper Reversal] ارتداد صاعد من قاع بولينجر $_bollingerLower (السعر: $price) -> شراء CALL";
@@ -621,16 +614,14 @@ jobs:
                   ? amount.toInt().toString()
                   : amount.toStringAsFixed(2);
 
-              // ضبط مبلغ الاستثمار في واجهة المنصة ثم النقر الحقيقي على زر شراء/بيع في الشارت لمنع رسالة (خطأ في فتح الصفقة)
               final clickResult = await _webViewController!.evaluateJavascript(source: '''
                 (function() {
                   try {
-                    // 1. ضبط مبلغ الصفقة داخل حقل الاستثمار في المنصة
                     const inputs = document.querySelectorAll('input');
                     for (let i = 0; i < inputs.length; i++) {
                       const inp = inputs[i];
                       const val = inp.value || '';
-                      if (val.includes('\\x24') || val.includes('€') || val.includes('£') || val.includes('৳') || /^[0-9.,\\\s]+\\$/.test(val.trim())) {
+                      if (val.includes('\\x24') || val.includes('€') || val.includes('£') || val.includes('৳') || !isNaN(parseFloat(val.trim()))) {
                         const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
                         if (nativeSetter) {
                           nativeSetter.call(inp, '$cleanAmount');
@@ -641,7 +632,6 @@ jobs:
                       }
                     }
 
-                    // 2. البحث عن زر الشراء الأخضر وزر البيع الأحمر الحقيقيين في المنصة
                     let targetBtn = null;
                     const buttons = document.querySelectorAll('button, [role="button"], .btn, [class*="button"]');
                     for (let i = 0; i < buttons.length; i++) {
@@ -677,10 +667,8 @@ jobs:
                 return;
               }
 
-              // انتظار 1.8 ثانية للتحقق من أن المنصة خصمت مبلغ الصفقة فعلياً وفتحت الصفقة دون خطأ
               await Future.delayed(const Duration(milliseconds: 1800));
 
-              // التحقق من عدم ظهور لافتة (خطأ في فتح الصفقة) ومن تغير الرصيد
               final verifyRes = await _webViewController!.evaluateJavascript(source: '''
                 (function() {
                   try {
@@ -704,7 +692,6 @@ jobs:
                 return;
               }
 
-              // تم التأكد من فتح الصفقة فعلياً!
               _isTradeOpen = true;
               _remainingSeconds = duration;
               _activeTradeEntryPrice = entryPriceBeforeClick;
@@ -736,15 +723,12 @@ jobs:
               final double beforeBal = _activeTradeBalanceBefore;
               final double diff = currentBal - beforeBal;
 
-              // لا يتم احتساب ربح أو خسارة إلا إذا تغير الرصيد الفعلي في المنصة!
               if (beforeBal > 0 && currentBal > 0) {
                 if (diff > 0.05) {
-                  // صفقة رابحة فعلياً زاد فيها الرصيد
                   _wonTrades++;
                   _currentTradeAmount = _baseAmount;
                   addLog("✔ صفقة رابحة مؤكدة (+ \$${diff.toStringAsFixed(2)}) | الرصيد الآن: \$${currentBal.toStringAsFixed(2)} | العودة للمبلغ الأساسي: \$$_baseAmount");
                 } else if (diff < -0.05) {
-                  // صفقة خاسرة فعلياً نقص فيها الرصيد
                   _lostTrades++;
                   if (_useMartingale) {
                     _currentTradeAmount = double.parse((_currentTradeAmount * _martingaleMultiplier).toStringAsFixed(2));
@@ -754,7 +738,6 @@ jobs:
                     addLog("✖ صفقة خاسرة مؤكدة (-\$${diff.abs().toStringAsFixed(2)}) | الرصيد الآن: \$${currentBal.toStringAsFixed(2)}");
                   }
                 } else {
-                  // الرصيد لم يتغير (تعادل أو لم تُنفذ الصفقة)
                   addLog("⚖ لم يتغير الرصيد بعد انتهاء الوقت (\$${currentBal.toStringAsFixed(2)}) — تعادل / لم تُحتسب خسارة أو ربح.");
                 }
               }
@@ -861,7 +844,6 @@ jobs:
                 function scanJsonForTicks(node) {
                   if (!node) return;
                   if (Array.isArray(node)) {
-                    // صيغة التيك المباشر: ["USDBRL_otc", 1728868860, 0.19188, 0]
                     if (node.length >= 3 && typeof node[0] === 'string' && typeof node[1] === 'number' && typeof node[2] === 'number') {
                       if (node[1] > 1500000000 && node[2] > 0) {
                         recordAssetTick(node[0], node[2]);
@@ -1738,7 +1720,6 @@ jobs:
                                   ),
                                   items: const [
                                     DropdownMenuItem(value: "AUTO_CHART", child: Text("تلقائي: الزوج المفتوح بالشارت حالياً")),
-                                    // أزواج العملات الرئيسية OTC
                                     DropdownMenuItem(value: "EUR/USD (OTC)", child: Text("EUR/USD (OTC)")),
                                     DropdownMenuItem(value: "GBP/USD (OTC)", child: Text("GBP/USD (OTC)")),
                                     DropdownMenuItem(value: "USD/JPY (OTC)", child: Text("USD/JPY (OTC)")),
@@ -1767,7 +1748,6 @@ jobs:
                                     DropdownMenuItem(value: "NZD/USD (OTC)", child: Text("NZD/USD (OTC)")),
                                     DropdownMenuItem(value: "USD/CAD (OTC)", child: Text("USD/CAD (OTC)")),
                                     DropdownMenuItem(value: "USD/CHF (OTC)", child: Text("USD/CHF (OTC)")),
-                                    // أزواج الأسواق الناشئة الشائعة في المنصة
                                     DropdownMenuItem(value: "USD/BRL (OTC)", child: Text("USD/BRL (OTC)")),
                                     DropdownMenuItem(value: "USD/EGP (OTC)", child: Text("USD/EGP (OTC)")),
                                     DropdownMenuItem(value: "USD/TRY (OTC)", child: Text("USD/TRY (OTC)")),
@@ -1781,14 +1761,12 @@ jobs:
                                     DropdownMenuItem(value: "USD/IDR (OTC)", child: Text("USD/IDR (OTC)")),
                                     DropdownMenuItem(value: "USD/COP (OTC)", child: Text("USD/COP (OTC)")),
                                     DropdownMenuItem(value: "USD/DZD (OTC)", child: Text("USD/DZD (OTC)")),
-                                    // السلع والعملات الرقمية
                                     DropdownMenuItem(value: "Gold (OTC)", child: Text("Gold / الذهب (OTC)")),
                                     DropdownMenuItem(value: "Silver (OTC)", child: Text("Silver / الفضة (OTC)")),
                                     DropdownMenuItem(value: "UKBrent (OTC)", child: Text("UKBrent / النفط (OTC)")),
                                     DropdownMenuItem(value: "USCrude (OTC)", child: Text("USCrude / الخام (OTC)")),
                                     DropdownMenuItem(value: "Bitcoin (OTC)", child: Text("Bitcoin (OTC)")),
                                     DropdownMenuItem(value: "Ethereum (OTC)", child: Text("Ethereum (OTC)")),
-                                    // الأزواج المباشرة
                                     DropdownMenuItem(value: "EUR/USD", child: Text("EUR/USD (مباشر)")),
                                     DropdownMenuItem(value: "GBP/USD", child: Text("GBP/USD (مباشر)")),
                                     DropdownMenuItem(value: "USD/JPY", child: Text("USD/JPY (مباشر)")),
