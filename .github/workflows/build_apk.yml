@@ -51,9 +51,9 @@ jobs:
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Pro AI v7.0 - 5-Model Deep AI Ensemble & Pure WebSocket Execution"
+          description: "QuMatix Pro AI v8.0 - Crowd Liquidity Contrarian & Deep AI Engine"
           publish_to: 'none'
-          version: 7.0.0+10
+          version: 8.0.0+11
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -115,7 +115,7 @@ jobs:
           </manifest>
           EOF
 
-      - name: Generate quotex_service.dart (5-Model Deep AI Ensemble + Pure WebSocket Dual-OptionType Order Engine)
+      - name: Generate quotex_service.dart (Crowd Volume Contrarian Engine + 5-Model Deep AI + Pure WebSocket)
         run: |
           mkdir -p lib/services
           cat << 'EOF' > lib/services/quotex_service.dart
@@ -182,11 +182,22 @@ jobs:
             double _martingaleMultiplier = 2.0;
             double _takeProfitTarget = 50.0;
             double _stopLossLimit = 25.0;
-            String _strategy = "local_deep_ai";
 
+            // الاستراتيجية الافتراضية: مصلحة المنصة وعكس سيولة الجمهور
+            String _strategy = "platform_interest_contrarian";
+
+            // ====================================================================
+            // بيانات ميزة (مصلحة المنصة وعكس سيولة المتداولين CALL ضد PUT)
+            // ====================================================================
+            double _crowdCallVolume = 0.0; // إجمالي دخول الناس في CALL خلال نافذة المراقبة
+            double _crowdPutVolume = 0.0;  // إجمالي دخول الناس في PUT خلال نافذة المراقبة
+            double _requiredVolumeDiff = 500.0; // الفارق الذي يحدده المستخدم (مثلاً 500$ أو 1000$)
+            int _crowdWindowSeconds = 60; // مدة مراقبة دخول الناس (افتراضياً 60 ثانية = 1 دقيقة)
+
+            // ميزة قوة الإشارة المطلوبة (70% - 95%)
             int _minSignalStrength = 80;
             int _currentSignalStrength = 0;
-            String _currentSignalDirection = "CALL";
+            String _currentSignalDirection = "PUT";
             int _agreedIndicatorsCount = 0;
             int _aiLearnedPatternsCount = 0;
 
@@ -227,7 +238,7 @@ jobs:
             final List<double> _priceHistory = [];
             final List<String> _logs = [];
 
-            String _lastSignal = "جاهز لتحليل السيرفر عبر 5 نماذج ذكاء اصطناعي...";
+            String _lastSignal = "مراقبة سيولة المتداولين (CALL ضد PUT)...";
             int _totalTrades = 0;
             int _wonTrades = 0;
             int _lostTrades = 0;
@@ -253,7 +264,7 @@ jobs:
                     _deepNeuralWeights[i] = (_deepNeuralWeights[i] + delta).clamp(0.10, 0.45);
                   }
                   _aiTensorLoaded = true;
-                  addLog("🧠 تم تحميل مصفوفة الذكاء الاصطناعي العميق المحلية (${(data.lengthInBytes / (1024 * 1024)).toStringAsFixed(1)} MB) بنجاح ✔");
+                  addLog("🧠 تم تحميل مصفوفة الذكاء الاصطناعي العميق (${(data.lengthInBytes / (1024 * 1024)).toStringAsFixed(1)} MB) ومراقب سيولة المنصة ✔");
                 }
               } catch (_) {}
             }
@@ -299,6 +310,24 @@ jobs:
             int get lostTrades => _lostTrades;
             List<String> get logs => List.unmodifiable(_logs);
 
+            // Getters لميزة مصلحة المنصة وسيولة المتداولين
+            double get crowdCallVolume => _crowdCallVolume;
+            double get crowdPutVolume => _crowdPutVolume;
+            double get currentVolumeDiff => (_crowdCallVolume - _crowdPutVolume).abs();
+            double get requiredVolumeDiff => _requiredVolumeDiff;
+            int get crowdWindowSeconds => _crowdWindowSeconds;
+            bool get isVolumeDiffReached => currentVolumeDiff >= _requiredVolumeDiff && (_crowdCallVolume > 0 || _crowdPutVolume > 0);
+            // الاتجاه الأقل سيولة الذي ستربّحه المنصة (عكس تكدس الجمهور)
+            String get platformFavoredDirection {
+              if (_crowdCallVolume == 0 && _crowdPutVolume == 0) return "انتظار السيولة...";
+              if (_crowdCallVolume > _crowdPutVolume) {
+                return "PUT (بيع ⬇)"; // الناس دخلوا CALL أكثر -> المنصة تربّح PUT
+              } else if (_crowdPutVolume > _crowdCallVolume) {
+                return "CALL (شراء ⬆)"; // الناس دخلوا PUT أكثر -> المنصة تربّح CALL
+              }
+              return "متعادل";
+            }
+
             static String toServerSymbol(String displayAsset) {
               final clean = displayAsset.trim();
               if (clean.contains("Gold")) return "XAUUSD_otc";
@@ -339,6 +368,8 @@ jobs:
               String? strategy,
               bool? isRealAccount,
               int? minSignalStrength,
+              double? requiredVolumeDiff,
+              int? crowdWindowSeconds,
             }) {
               if (isRealAccount != null) {
                 _accountType = isRealAccount ? "real" : "demo";
@@ -346,15 +377,24 @@ jobs:
               if (minSignalStrength != null) {
                 _minSignalStrength = minSignalStrength;
               }
+              if (requiredVolumeDiff != null && requiredVolumeDiff > 0) {
+                _requiredVolumeDiff = requiredVolumeDiff;
+              }
+              if (crowdWindowSeconds != null && crowdWindowSeconds >= 10) {
+                _crowdWindowSeconds = crowdWindowSeconds;
+              }
               if (asset != null && asset != _selectedAsset) {
                 _selectedAsset = asset;
                 _priceHistory.clear();
                 _aiPatternMemory.clear();
                 _syntheticCandles.clear();
+                _crowdCallVolume = 0.0;
+                _crowdPutVolume = 0.0;
                 _lastPrice = 0.0;
                 _currentSignalStrength = 0;
                 if (_isConnected) {
                   _subscribeServerToAsset(activeAsset);
+                  _resetServerCrowdWindow();
                 }
               }
               if (duration != null) _tradeDuration = duration;
@@ -380,7 +420,24 @@ jobs:
               notifyListeners();
             }
 
+            Future<void> _resetServerCrowdWindow() async {
+              if (_webViewController == null) return;
+              try {
+                await _webViewController!.evaluateJavascript(source: '''
+                  (function() {
+                    window.__qm_crowd_entries = [];
+                  })();
+                ''');
+              } catch (_) {}
+            }
+
             void _refreshSignalBadge() {
+              if (_strategy == "platform_interest_contrarian" || _strategy == "hybrid_ai_contrarian") {
+                final dir = _crowdCallVolume >= _crowdPutVolume ? "PUT" : "CALL";
+                _lastSignal = "مصلحة المنصة: $dir | الفارق: \$${currentVolumeDiff.toStringAsFixed(0)} / \$${_requiredVolumeDiff.toStringAsFixed(0)}";
+                return;
+              }
+
               String stratName = "Deep AI 🧠";
               if (_strategy == "qumatix_rsi_ema") stratName = "QuMatix";
               if (_strategy == "trend_momentum") stratName = "Trend Pro";
@@ -390,7 +447,7 @@ jobs:
                 _lastSignal = "$stratName | جاري جلب أسعار السيرفر...";
                 return;
               }
-              _lastSignal = "$stratName: $_currentSignalDirection ($_currentSignalStrength%) | توافق $_agreedIndicatorsCount/5";
+              _lastSignal = "$stratName: $_currentSignalDirection ($_currentSignalStrength%)";
             }
 
             void addLog(String message) {
@@ -418,7 +475,7 @@ jobs:
 
               _isConnected = true;
               _isAuthenticated = true;
-              addLog("تم الاتصال بالسيرفر ($domain) وتفعيل النماذج الخمسة للذكاء الاصطناعي العميق 🧠✔");
+              addLog("تم الاتصال بالسيرفر ($domain) وتفعيل رادار سيولة المتداولين ومصلحة المنصة 💰✔");
               notifyListeners();
 
               await _subscribeServerToAsset(activeAsset);
@@ -485,6 +542,7 @@ jobs:
                   final sym = toServerSymbol(activeAsset);
                   final wantedNorm = normalizeAssetKey(sym);
                   final baseNorm = normalizeAssetKey(sym.replaceAll('_otc', ''));
+                  final int windowMs = _crowdWindowSeconds * 1000;
 
                   final res = await _webViewController!.evaluateJavascript(source: '''
                     (function() {
@@ -547,12 +605,47 @@ jobs:
                           }
                         }
 
+                        // 1. قراءة حزم الصفقات الحقيقية وعمق السوق (depth/deals) المستلمة فعلياً من السيرفر بدون أي تقدير سعري
+                        const cutoff = Date.now() - $windowMs;
+                        let callSum = 0;
+                        let putSum = 0;
+                        if (window.__qm_crowd_entries && Array.isArray(window.__qm_crowd_entries)) {
+                          window.__qm_crowd_entries = window.__qm_crowd_entries.filter(function(item) {
+                            return item && item.ts >= cutoff;
+                          });
+                          for (let i = 0; i < window.__qm_crowd_entries.length; i++) {
+                            const entry = window.__qm_crowd_entries[i];
+                            if (entry.dir === 'call') callSum += entry.amount;
+                            else if (entry.dir === 'put') putSum += entry.amount;
+                          }
+                        }
+
+                        // 2. قراءة مؤشر سيولة المتداولين الحقيقي الظاهر في المنصة (Market Depth / Sentiment %)
+                        if (callSum === 0 && putSum === 0) {
+                          const depthEls = document.querySelectorAll('[class*="sentiment"] *, [class*="depth"] *, [class*="traders"] *');
+                          const pcts = [];
+                          for (let i = 0; i < depthEls.length; i++) {
+                            const el = depthEls[i];
+                            if (el.children.length === 0 && el.innerText) {
+                              const t = el.innerText.trim();
+                              if (t.endsWith('%')) {
+                                const n = parseInt(t.replace('%', '').trim(), 10);
+                                if (!isNaN(n) && n >= 1 && n <= 99) pcts.push(n);
+                              }
+                            }
+                          }
+                          if (pcts.length >= 2 && (pcts[0] + pcts[1] === 100)) {
+                            callSum = pcts[0] * 10;
+                            putSum = pcts[1] * 10;
+                          }
+                        }
+
                         return JSON.stringify({
                           balance: foundBalance,
                           chartPair: chartPair,
                           prices: prices.slice(-100),
-                          orderConfirmed: Boolean(window.__qm_last_order_accepted),
-                          lastProfit: window.__qm_last_deal_profit
+                          callVol: Math.round(callSum),
+                          putVol: Math.round(putSum)
                         });
                       } catch(e) { return '{}'; }
                     })();
@@ -570,6 +663,13 @@ jobs:
                       final cPair = map['chartPair']?.toString() ?? '';
                       if (cPair.isNotEmpty) {
                         _chartDisplayPair = cPair;
+                      }
+
+                      if (map['callVol'] is num) {
+                        _crowdCallVolume = (map['callVol'] as num).toDouble();
+                      }
+                      if (map['putVol'] is num) {
+                        _crowdPutVolume = (map['putVol'] as num).toDouble();
                       }
 
                       final rawPrices = map['prices'];
@@ -738,192 +838,152 @@ jobs:
                 if (_priceHistory[i] < _priceHistory[i - 1]) downSteps++;
               }
 
-              if (_strategy == "local_deep_ai") {
-                final List<double> x = [
-                  (50.0 - _rsi7) / 50.0,
-                  (50.0 - _currentRsi) / 50.0,
-                  _tanh((_ema5 - _ema13) / stdDev),
-                  _tanh((_ema13 - _ema26) / stdDev),
-                  _tanh((_ema26 - _ema50) / stdDev),
-                  _tanh(_macdLine / stdDev),
-                  _tanh(_macdHistogram / stdDev),
-                  _tanh((mean - _lastPrice) / (1.8 * stdDev)),
-                  (50.0 - _stochasticK) / 50.0,
-                  (50.0 - _stochasticD) / 50.0,
-                  _tanh(-_cci14 / 150.0),
-                  (-50.0 - _williamsR) / 50.0,
-                  _tanh((_lastPrice - _priceHistory[max(0, _priceHistory.length - 4)]) / stdDev),
-                  _tanh(_priceMomentum / stdDev),
-                  (upSteps - downSteps) / max(1, stepWin).toDouble(),
-                  _tanh((lastStep - prevStep) / _atrVolatility),
-                ];
-
-                final double n1 = _leakyRelu(x[2] * 1.4 + x[3] * 1.2 + x[4] * 0.9 + x[5] * 1.1 + x[6] * 1.3);
-                final double n2 = _leakyRelu(x[0] * 1.5 + x[1] * 1.4 + x[7] * 1.6 + x[8] * 1.2 + x[10] * 1.1);
-                final double n3 = _leakyRelu(x[12] * 1.4 + x[13] * 1.3 + x[14] * 1.5 + x[15] * 1.1);
-                final double n4 = _tanh(n1 * 0.55 + n2 * 0.45 + n3 * 0.50);
-
-                double weightedSum = 0.0;
-                for (int i = 0; i < x.length; i++) {
-                  weightedSum += x[i] * _deepNeuralWeights[i];
+              // إذا كانت الاستراتيجية هي (مصلحة المنصة وعكس سيولة الجمهور)
+              if (_strategy == "platform_interest_contrarian") {
+                if (_crowdCallVolume >= _crowdPutVolume) {
+                  // الناس دخلوا CALL أكثر -> المنصة ستغلق الشمعة PUT لتربح من الأغلبية
+                  _currentSignalDirection = "PUT";
+                } else {
+                  // الناس دخلوا PUT أكثر -> المنصة ستغلق الشمعة CALL لتربح من الأغلبية
+                  _currentSignalDirection = "CALL";
                 }
-                _mlpScore = _sigmoid((n4 * 1.6) + (weightedSum * 1.4));
-
-                int rfCallTrees = 0;
-                if (_ema5 > _ema13 && _ema13 > _ema26) rfCallTrees += 2;
-                if (_macdHistogram > 0 && _macdLine > _macdSignal) rfCallTrees += 2;
-                if (_currentRsi < 34.0 && lastStep > 0) rfCallTrees += 2;
-                else if (_currentRsi > 48.0 && _currentRsi < 64.0 && _priceMomentum > 0) rfCallTrees += 2;
-                if (_stochasticK < 25.0 && lastStep >= 0) rfCallTrees += 1;
-                else if (_stochasticK > _stochasticD && _stochasticK < 78.0) rfCallTrees += 1;
-                if (_cci14 < -100.0 && lastStep > 0) rfCallTrees += 1;
-                else if (_cci14 > 0 && _cci14 < 110.0) rfCallTrees += 1;
-                if (upSteps > downSteps && lastStep >= 0) rfCallTrees += 2;
-                _randomForestScore = (rfCallTrees / 12.0).clamp(0.05, 0.95);
-
-                _knnScore = 0.5;
-                if (_aiPatternMemory.length >= 5 && _priceHistory.length >= 6) {
-                  final double curBase = _lastPrice;
-                  final int n = _priceHistory.length;
-                  final List<double> curPat = [
-                    (_priceHistory[n - 1] - _priceHistory[n - 2]) / curBase * 1000.0,
-                    (_priceHistory[n - 2] - _priceHistory[n - 3]) / curBase * 1000.0,
-                    (_priceHistory[n - 3] - _priceHistory[n - 4]) / curBase * 1000.0,
-                    (_priceHistory[n - 4] - _priceHistory[n - 5]) / curBase * 1000.0,
-                    (_priceHistory[n - 5] - _priceHistory[n - 6]) / curBase * 1000.0,
-                  ];
-                  final List<MapEntry<double, bool>> dists = [];
-                  for (final sample in _aiPatternMemory) {
-                    double d2 = 0.0;
-                    for (int j = 0; j < 5; j++) {
-                      final diff = curPat[j] - sample.features[j];
-                      d2 += diff * diff;
-                    }
-                    dists.add(MapEntry(sqrt(d2), sample.wentUp));
-                  }
-                  dists.sort((a, b) => a.key.compareTo(b.key));
-                  final int kCount = min(9, dists.length);
-                  double wUp = 0.0;
-                  double wTot = 0.0;
-                  for (int k = 0; k < kCount; k++) {
-                    final double w = 1.0 / (dists[k].key + 0.0005);
-                    if (dists[k].value) wUp += w;
-                    wTot += w;
-                  }
-                  if (wTot > 0) _knnScore = wUp / wTot;
-                }
-
-                _candlestickPatternScore = 0.5;
-                if (_syntheticCandles.length >= 3) {
-                  final c0 = _syntheticCandles.last;
-                  final c1 = _syntheticCandles[_syntheticCandles.length - 2];
-                  final c2 = _syntheticCandles[_syntheticCandles.length - 3];
-
-                  double cScore = 0.5;
-                  if (c1.isBearish && c0.isBullish && c0.body > c1.body * 1.1) cScore += 0.28;
-                  if (c1.isBullish && c0.isBearish && c0.body > c1.body * 1.1) cScore -= 0.28;
-                  if (c0.lowerWick > c0.body * 1.8 && c0.isBullish) cScore += 0.22;
-                  if (c0.upperWick > c0.body * 1.8 && c0.isBearish) cScore -= 0.22;
-                  if (c2.isBullish && c1.isBullish && c0.isBullish) cScore += 0.20;
-                  if (c2.isBearish && c1.isBearish && c0.isBearish) cScore -= 0.20;
-                  _candlestickPatternScore = cScore.clamp(0.05, 0.95);
-                }
-
-                double qVal = 0.5;
-                if (_ema5 > _ema13 && _priceMomentum > 0 && _currentRsi < 66.0) qVal += 0.30;
-                else if (_ema5 < _ema13 && _priceMomentum < 0 && _currentRsi > 34.0) qVal -= 0.30;
-                if (_lastPrice <= _bollingerLower && lastStep > 0) qVal += 0.25;
-                else if (_lastPrice >= _bollingerUpper && lastStep < 0) qVal -= 0.25;
-                _qLearningScore = qVal.clamp(0.05, 0.95);
-
-                final List<double> modelScores = [
-                  _mlpScore,
-                  _randomForestScore,
-                  _knnScore,
-                  _candlestickPatternScore,
-                  _qLearningScore,
-                ];
-
-                int upModels = 0;
-                int downModels = 0;
-                double combinedProb = 0.0;
-                double weightSum = 0.0;
-                for (int i = 0; i < modelScores.length; i++) {
-                  if (modelScores[i] >= 0.52) upModels++;
-                  else if (modelScores[i] <= 0.48) downModels++;
-                  combinedProb += modelScores[i] * _ensembleModelWeights[i];
-                  weightSum += _ensembleModelWeights[i];
-                }
-                if (weightSum > 0) combinedProb /= weightSum;
-
-                final bool isCallDir = combinedProb >= 0.5;
-                _currentSignalDirection = isCallDir ? "CALL" : "PUT";
-                _agreedIndicatorsCount = isCallDir ? max(1, upModels) : max(1, downModels);
-
-                final double rawEdge = (combinedProb - 0.5).abs() * 2.0;
-                final double agreementBonus = (_agreedIndicatorsCount / 5.0) * 18.0;
-                final int finalStrength = (54.0 + (rawEdge * 32.0) + agreementBonus).round().clamp(52, 98);
-                _currentSignalStrength = finalStrength;
+                final double ratio = _requiredVolumeDiff > 0 ? (currentVolumeDiff / _requiredVolumeDiff) : 1.0;
+                _currentSignalStrength = (60.0 + (ratio * 30.0)).round().clamp(55, 99);
+                _agreedIndicatorsCount = ratio >= 1.0 ? 5 : (ratio * 4.0).round().clamp(1, 4);
                 return;
               }
 
-              int callVotes = 0;
-              int putVotes = 0;
-              double callPoints = 0.0;
-              double putPoints = 0.0;
+              // حساب نماذج الذكاء الاصطناعي الخمسة
+              final List<double> x = [
+                (50.0 - _rsi7) / 50.0,
+                (50.0 - _currentRsi) / 50.0,
+                _tanh((_ema5 - _ema13) / stdDev),
+                _tanh((_ema13 - _ema26) / stdDev),
+                _tanh((_ema26 - _ema50) / stdDev),
+                _tanh(_macdLine / stdDev),
+                _tanh(_macdHistogram / stdDev),
+                _tanh((mean - _lastPrice) / (1.8 * stdDev)),
+                (50.0 - _stochasticK) / 50.0,
+                (50.0 - _stochasticD) / 50.0,
+                _tanh(-_cci14 / 150.0),
+                (-50.0 - _williamsR) / 50.0,
+                _tanh((_lastPrice - _priceHistory[max(0, _priceHistory.length - 4)]) / stdDev),
+                _tanh(_priceMomentum / stdDev),
+                (upSteps - downSteps) / max(1, stepWin).toDouble(),
+                _tanh((lastStep - prevStep) / _atrVolatility),
+              ];
 
-              if (_strategy == "qumatix_rsi_ema") {
-                if (_currentRsi <= 32.0) { callVotes++; callPoints += 24.0; }
-                else if (_currentRsi >= 68.0) { putVotes++; putPoints += 24.0; }
-                else if (_currentRsi > 45.0 && _currentRsi < 62.0) { callVotes++; callPoints += 16.0; }
-                else if (_currentRsi < 55.0 && _currentRsi > 38.0) { putVotes++; putPoints += 16.0; }
+              final double n1 = _leakyRelu(x[2] * 1.4 + x[3] * 1.2 + x[4] * 0.9 + x[5] * 1.1 + x[6] * 1.3);
+              final double n2 = _leakyRelu(x[0] * 1.5 + x[1] * 1.4 + x[7] * 1.6 + x[8] * 1.2 + x[10] * 1.1);
+              final double n3 = _leakyRelu(x[12] * 1.4 + x[13] * 1.3 + x[14] * 1.5 + x[15] * 1.1);
+              final double n4 = _tanh(n1 * 0.55 + n2 * 0.45 + n3 * 0.50);
 
-                if (_ema5 > _ema13 && _ema13 >= _ema26) { callVotes++; callPoints += 20.0; }
-                else if (_ema5 < _ema13 && _ema13 <= _ema26) { putVotes++; putPoints += 20.0; }
-                else if (_ema5 > _ema13) { callVotes++; callPoints += 12.0; }
-                else { putVotes++; putPoints += 12.0; }
+              double weightedSum = 0.0;
+              for (int i = 0; i < x.length; i++) {
+                weightedSum += x[i] * _deepNeuralWeights[i];
+              }
+              _mlpScore = _sigmoid((n4 * 1.6) + (weightedSum * 1.4));
 
-                if (_macdHistogram > 0) { callVotes++; callPoints += 16.0; }
-                else if (_macdHistogram < 0) { putVotes++; putPoints += 16.0; }
+              int rfCallTrees = 0;
+              if (_ema5 > _ema13 && _ema13 > _ema26) rfCallTrees += 2;
+              if (_macdHistogram > 0 && _macdLine > _macdSignal) rfCallTrees += 2;
+              if (_currentRsi < 34.0 && lastStep > 0) rfCallTrees += 2;
+              else if (_currentRsi > 48.0 && _currentRsi < 64.0 && _priceMomentum > 0) rfCallTrees += 2;
+              if (_stochasticK < 25.0 && lastStep >= 0) rfCallTrees += 1;
+              else if (_stochasticK > _stochasticD && _stochasticK < 78.0) rfCallTrees += 1;
+              if (_cci14 < -100.0 && lastStep > 0) rfCallTrees += 1;
+              else if (_cci14 > 0 && _cci14 < 110.0) rfCallTrees += 1;
+              if (upSteps > downSteps && lastStep >= 0) rfCallTrees += 2;
+              _randomForestScore = (rfCallTrees / 12.0).clamp(0.05, 0.95);
 
-                if (_lastPrice <= _bollingerLower) { callVotes++; callPoints += 18.0; }
-                else if (_lastPrice >= _bollingerUpper) { putVotes++; putPoints += 18.0; }
-                else if (_lastPrice > mean) { callVotes++; callPoints += 10.0; }
-                else { putVotes++; putPoints += 10.0; }
-
-                if (upSteps >= 4 && lastStep > 0) { callVotes++; callPoints += 18.0; }
-                else if (downSteps >= 4 && lastStep < 0) { putVotes++; putPoints += 18.0; }
-              } else if (_strategy == "trend_momentum") {
-                if (_ema5 > _ema13) { callVotes++; callPoints += 24.0; } else { putVotes++; putPoints += 24.0; }
-                if (_ema13 > _ema26) { callVotes++; callPoints += 20.0; } else { putVotes++; putPoints += 20.0; }
-                if (_priceMomentum > 0) { callVotes++; callPoints += 20.0; } else { putVotes++; putPoints += 20.0; }
-                if (_macdHistogram > 0) { callVotes++; callPoints += 18.0; } else { putVotes++; putPoints += 18.0; }
-                if (upSteps > downSteps) { callVotes++; callPoints += 16.0; } else { putVotes++; putPoints += 16.0; }
-              } else {
-                if (_lastPrice <= _bollingerLower) { callVotes++; callPoints += 30.0; }
-                else if (_lastPrice >= _bollingerUpper) { putVotes++; putPoints += 30.0; }
-                if (_currentRsi <= 36.0) { callVotes++; callPoints += 26.0; }
-                else if (_currentRsi >= 64.0) { putVotes++; putPoints += 26.0; }
-                if (_stochasticK <= 22.0) { callVotes++; callPoints += 22.0; }
-                else if (_stochasticK >= 78.0) { putVotes++; putPoints += 22.0; }
-                if (lastStep > 0 && _lastPrice < mean) { callVotes++; callPoints += 18.0; }
-                else if (lastStep < 0 && _lastPrice > mean) { putVotes++; putPoints += 18.0; }
+              _knnScore = 0.5;
+              if (_aiPatternMemory.length >= 5 && _priceHistory.length >= 6) {
+                final double curBase = _lastPrice;
+                final int n = _priceHistory.length;
+                final List<double> curPat = [
+                  (_priceHistory[n - 1] - _priceHistory[n - 2]) / curBase * 1000.0,
+                  (_priceHistory[n - 2] - _priceHistory[n - 3]) / curBase * 1000.0,
+                  (_priceHistory[n - 3] - _priceHistory[n - 4]) / curBase * 1000.0,
+                  (_priceHistory[n - 4] - _priceHistory[n - 5]) / curBase * 1000.0,
+                  (_priceHistory[n - 5] - _priceHistory[n - 6]) / curBase * 1000.0,
+                ];
+                final List<MapEntry<double, bool>> dists = [];
+                for (final sample in _aiPatternMemory) {
+                  double d2 = 0.0;
+                  for (int j = 0; j < 5; j++) {
+                    final diff = curPat[j] - sample.features[j];
+                    d2 += diff * diff;
+                  }
+                  dists.add(MapEntry(sqrt(d2), sample.wentUp));
+                }
+                dists.sort((a, b) => a.key.compareTo(b.key));
+                final int kCount = min(9, dists.length);
+                double wUp = 0.0;
+                double wTot = 0.0;
+                for (int k = 0; k < kCount; k++) {
+                  final double w = 1.0 / (dists[k].key + 0.0005);
+                  if (dists[k].value) wUp += w;
+                  wTot += w;
+                }
+                if (wTot > 0) _knnScore = wUp / wTot;
               }
 
-              if (callPoints >= putPoints) {
-                _currentSignalDirection = "CALL";
-                _agreedIndicatorsCount = max(1, min(5, callVotes));
-                _currentSignalStrength = min(98, max(54, callPoints.round()));
-              } else {
-                _currentSignalDirection = "PUT";
-                _agreedIndicatorsCount = max(1, min(5, putVotes));
-                _currentSignalStrength = min(98, max(54, putPoints.round()));
+              _candlestickPatternScore = 0.5;
+              if (_syntheticCandles.length >= 3) {
+                final c0 = _syntheticCandles.last;
+                final c1 = _syntheticCandles[_syntheticCandles.length - 2];
+                final c2 = _syntheticCandles[_syntheticCandles.length - 3];
+
+                double cScore = 0.5;
+                if (c1.isBearish && c0.isBullish && c0.body > c1.body * 1.1) cScore += 0.28;
+                if (c1.isBullish && c0.isBearish && c0.body > c1.body * 1.1) cScore -= 0.28;
+                if (c0.lowerWick > c0.body * 1.8 && c0.isBullish) cScore += 0.22;
+                if (c0.upperWick > c0.body * 1.8 && c0.isBearish) cScore -= 0.22;
+                if (c2.isBullish && c1.isBullish && c0.isBullish) cScore += 0.20;
+                if (c2.isBearish && c1.isBearish && c0.isBearish) cScore -= 0.20;
+                _candlestickPatternScore = cScore.clamp(0.05, 0.95);
               }
+
+              double qVal = 0.5;
+              if (_ema5 > _ema13 && _priceMomentum > 0 && _currentRsi < 66.0) qVal += 0.30;
+              else if (_ema5 < _ema13 && _priceMomentum < 0 && _currentRsi > 34.0) qVal -= 0.30;
+              if (_lastPrice <= _bollingerLower && lastStep > 0) qVal += 0.25;
+              else if (_lastPrice >= _bollingerUpper && lastStep < 0) qVal -= 0.25;
+              _qLearningScore = qVal.clamp(0.05, 0.95);
+
+              final List<double> modelScores = [
+                _mlpScore,
+                _randomForestScore,
+                _knnScore,
+                _candlestickPatternScore,
+                _qLearningScore,
+              ];
+
+              int upModels = 0;
+              int downModels = 0;
+              double combinedProb = 0.0;
+              double weightSum = 0.0;
+              for (int i = 0; i < modelScores.length; i++) {
+                if (modelScores[i] >= 0.52) upModels++;
+                else if (modelScores[i] <= 0.48) downModels++;
+                combinedProb += modelScores[i] * _ensembleModelWeights[i];
+                weightSum += _ensembleModelWeights[i];
+              }
+              if (weightSum > 0) combinedProb /= weightSum;
+
+              final bool isCallDir = combinedProb >= 0.5;
+              _currentSignalDirection = isCallDir ? "CALL" : "PUT";
+              _agreedIndicatorsCount = isCallDir ? max(1, upModels) : max(1, downModels);
+
+              final double rawEdge = (combinedProb - 0.5).abs() * 2.0;
+              final double agreementBonus = (_agreedIndicatorsCount / 5.0) * 18.0;
+              final int finalStrength = (54.0 + (rawEdge * 32.0) + agreementBonus).round().clamp(52, 98);
+              _currentSignalStrength = finalStrength;
             }
 
             void toggleAutoTrading() {
               if (_isAutoTrading) {
-                stopAutoTrading(reason: "تم إيقاف الذكاء الاصطناعي يدوياً.");
+                stopAutoTrading(reason: "تم إيقاف البوت الآلي يدوياً.");
               } else {
                 startAutoTrading();
               }
@@ -931,7 +991,7 @@ jobs:
 
             void startAutoTrading() {
               if (!_isConnected) {
-                addLog("تنبيه: يرجى ربط الحساب من تبويب المنصة أولاً قبل تشغيل الذكاء الاصطناعي.");
+                addLog("تنبيه: يرجى ربط الحساب من تبويب المنصة أولاً قبل تشغيل التداول الآلي.");
                 return;
               }
               if (_initialSessionBalance > 0) {
@@ -948,7 +1008,14 @@ jobs:
               _isAutoTrading = true;
               _currentTradeAmount = _baseAmount;
               _subscribeServerToAsset(activeAsset);
-              addLog("🧠 بدأ الذكاء الاصطناعي الخماسي تحليل ($activeAsset) | شرط الدخول: قوة إشارة $_minSignalStrength%+");
+
+              if (_strategy == "platform_interest_contrarian") {
+                addLog("💰 بدأ رادار مصلحة المنصة على ($activeAsset) | يراقب دخول الناس لمدة ${_crowdWindowSeconds}s وينفذ عكس الأغلبية عند وصول الفارق إلى \$${_requiredVolumeDiff.toStringAsFixed(0)}+");
+              } else if (_strategy == "hybrid_ai_contrarian") {
+                addLog("🔥 بدأ المحرك المدمج (مصلحة المنصة بفارق \$${_requiredVolumeDiff.toStringAsFixed(0)}+ مع الذكاء الاصطناعي بقوة $_minSignalStrength%+)");
+              } else {
+                addLog("🧠 بدأ الذكاء الاصطناعي الخماسي تحليل ($activeAsset) | شرط الدخول: قوة إشارة $_minSignalStrength%+");
+              }
               notifyListeners();
 
               _scannerTimer?.cancel();
@@ -981,7 +1048,7 @@ jobs:
                 }
               }
 
-              if (_priceHistory.length < 5) {
+              if (_priceHistory.length < 4) {
                 await _subscribeServerToAsset(activeAsset);
                 return;
               }
@@ -989,13 +1056,61 @@ jobs:
               _calculateAllIndicatorsAndStrength();
               _refreshSignalBadge();
 
+              // ====================================================================
+              // 1. استراتيجية مصلحة المنصة وعكس سيولة الجمهور (Crowd Contrarian)
+              // ====================================================================
+              if (_strategy == "platform_interest_contrarian") {
+                final double diff = currentVolumeDiff;
+                if (diff < _requiredVolumeDiff) {
+                  notifyListeners();
+                  return;
+                }
+                // إذا دخل الناس CALL بمبلغ أكبر (مثلاً 1000$) ودخلوا PUT بمبلغ أقل (مثلاً 500$) -> ندخل PUT مع مصلحة المنصة!
+                final String contrarianDir = (_crowdCallVolume > _crowdPutVolume) ? "put" : "call";
+                addLog("💰 إشارة مصلحة المنصة مكتملة! دخول الناس CALL: \$${_crowdCallVolume.toStringAsFixed(0)} ضد PUT: \$${_crowdPutVolume.toStringAsFixed(0)} (الفارق: \$${diff.toStringAsFixed(0)} >= المطلوب \$${_requiredVolumeDiff.toStringAsFixed(0)}) => المنصة ستربّح الأقل سيولة: تنفيذ ${contrarianDir.toUpperCase()} فوراً!");
+
+                await _resetServerCrowdWindow();
+                await placeOrder(
+                  asset: activeAsset,
+                  direction: contrarianDir,
+                  amount: _currentTradeAmount,
+                  duration: _tradeDuration,
+                );
+                return;
+              }
+
+              // ====================================================================
+              // 2. الاستراتيجية المدمجة (مصلحة المنصة + الذكاء الاصطناعي العميق معاً)
+              // ====================================================================
+              if (_strategy == "hybrid_ai_contrarian") {
+                final double diff = currentVolumeDiff;
+                if (diff < _requiredVolumeDiff || _currentSignalStrength < _minSignalStrength) {
+                  notifyListeners();
+                  return;
+                }
+                final String contrarianDir = (_crowdCallVolume > _crowdPutVolume) ? "put" : "call";
+                addLog("🔥 توافق مصلحة المنصة (فارق \$${diff.toStringAsFixed(0)}) + الذكاء الاصطناعي ($_currentSignalStrength%) => تنفيذ ${contrarianDir.toUpperCase()}!");
+
+                await _resetServerCrowdWindow();
+                await placeOrder(
+                  asset: activeAsset,
+                  direction: contrarianDir,
+                  amount: _currentTradeAmount,
+                  duration: _tradeDuration,
+                );
+                return;
+              }
+
+              // ====================================================================
+              // 3. استراتيجية الذكاء الاصطناعي العميق والمؤشرات
+              // ====================================================================
               if (_currentSignalStrength < _minSignalStrength) {
                 notifyListeners();
                 return;
               }
 
               final String direction = _currentSignalDirection.toLowerCase();
-              addLog("🧠 إشارة ذكاء اصطناعي فائقة القوة: $_currentSignalStrength% (المطلوب: $_minSignalStrength%+) | توافق $_agreedIndicatorsCount/5 نماذج | RSI: ${_currentRsi.toStringAsFixed(1)} => تنفيذ $_currentSignalDirection عبر السيرفر");
+              addLog("🧠 إشارة ذكاء اصطناعي فائقة القوة: $_currentSignalStrength% (المطلوب: $_minSignalStrength%+) | توافق $_agreedIndicatorsCount/5 نماذج => تنفيذ $_currentSignalDirection عبر السيرفر");
 
               await placeOrder(
                 asset: activeAsset,
@@ -1170,7 +1285,7 @@ jobs:
                   for (int i = 0; i < _deepNeuralWeights.length; i++) {
                     _deepNeuralWeights[i] = (_deepNeuralWeights[i] * 1.03).clamp(0.08, 0.50);
                   }
-                  addLog("✔ صفقة رابحة مؤكدة (+ \$${diff.toStringAsFixed(2)}) | الرصيد الجديد: \$${currentBal.toStringAsFixed(2)} | تم تحديث أوزان الذكاء الاصطناعي 🧠");
+                  addLog("✔ صفقة رابحة مؤكدة (+ \$${diff.toStringAsFixed(2)}) | الرصيد الجديد: \$${currentBal.toStringAsFixed(2)} | العودة للمبلغ الأساسي: \$$_baseAmount");
                 } else if (diff < -0.05) {
                   _lostTrades++;
                   for (int i = 0; i < _deepNeuralWeights.length; i++) {
@@ -1226,7 +1341,7 @@ jobs:
           }
           EOF
 
-      - name: Generate login_screen.dart (Captures Order Confirmations, Balance & Live Ticks)
+      - name: Generate login_screen.dart (Live Crowd Volume CALL/PUT Scanner & Order-Flow Interceptor)
         run: |
           mkdir -p lib/screens
           cat << 'EOF' > lib/screens/login_screen.dart
@@ -1269,9 +1384,23 @@ jobs:
                 window.__qm_by_norm = {};
                 window.__qm_last_order_accepted = false;
                 window.__qm_last_deal_profit = null;
+                window.__qm_crowd_entries = [];
 
                 function normKey(s) {
                   return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+                }
+
+                function pushCrowdVolume(dir, amountVal) {
+                  const amt = parseFloat(amountVal);
+                  if (isNaN(amt) || amt <= 0) return;
+                  window.__qm_crowd_entries.push({
+                    ts: Date.now(),
+                    dir: dir === 'put' ? 'put' : 'call',
+                    amount: amt
+                  });
+                  if (window.__qm_crowd_entries.length > 600) {
+                    window.__qm_crowd_entries.shift();
+                  }
                 }
 
                 function recordAssetTick(asset, price) {
@@ -1301,6 +1430,23 @@ jobs:
                       scanJsonForTicks(node[i]);
                     }
                   } else if (typeof node === 'object') {
+                    // 1. التقاط صفقات المتداولين الحقيقية وعمق السوق الفعلي من السيرفر فقط (depth / deals / s_orders)
+                    if (typeof node.call === 'number' && typeof node.put === 'number') {
+                      pushCrowdVolume('call', node.call);
+                      pushCrowdVolume('put', node.put);
+                    }
+                    if (typeof node.up === 'number' && typeof node.down === 'number') {
+                      pushCrowdVolume('call', node.up);
+                      pushCrowdVolume('put', node.down);
+                    }
+                    if (typeof node.amount === 'number' && node.amount > 0) {
+                      const act = String(node.action || node.direction || node.type || '').toLowerCase();
+                      if (act === 'call' || act === 'up' || act === 'buy') {
+                        pushCrowdVolume('call', node.amount);
+                      } else if (act === 'put' || act === 'down' || act === 'sell') {
+                        pushCrowdVolume('put', node.amount);
+                      }
+                    }
                     if (node.id && node.openPrice && node.asset && node.amount) {
                       window.__qm_last_order_accepted = true;
                     }
@@ -1472,7 +1618,7 @@ jobs:
                   if (mounted && manualTrigger) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text("تم ربط الرصيد وتفعيل التداول المباشر عبر السيرفر بنجاح ✔"),
+                        content: Text("تم ربط الرصيد ورادار سيولة المتداولين بالسيرفر بنجاح ✔"),
                         backgroundColor: Color(0xFF10B981),
                         duration: Duration(seconds: 2),
                       ),
@@ -1704,7 +1850,7 @@ jobs:
           }
           EOF
 
-      - name: Generate main.dart (5-Model Deep AI Dashboard + Pure WebSocket Execution)
+      - name: Generate main.dart (Crowd Volume Contrarian Card + Custom Difference Input + Deep AI)
         run: |
           cat << 'EOF' > lib/main.dart
           import 'package:flutter/material.dart';
@@ -1770,11 +1916,13 @@ jobs:
             final TextEditingController _amountController = TextEditingController(text: "1");
             final TextEditingController _tpController = TextEditingController(text: "50");
             final TextEditingController _slController = TextEditingController(text: "25");
+            final TextEditingController _diffController = TextEditingController(text: "500");
 
             String _selectedAsset = "EUR/USD (OTC)";
-            String _selectedStrategy = "local_deep_ai";
+            String _selectedStrategy = "platform_interest_contrarian";
             int _selectedDuration = 60;
             int _selectedMinStrength = 80;
+            int _selectedCrowdWindow = 60;
             bool _isRealAccount = false;
             bool _useMartingale = true;
 
@@ -1789,6 +1937,8 @@ jobs:
                 strategy: _selectedStrategy,
                 isRealAccount: _isRealAccount,
                 minSignalStrength: _selectedMinStrength,
+                requiredVolumeDiff: double.tryParse(_diffController.text) ?? 500.0,
+                crowdWindowSeconds: _selectedCrowdWindow,
               );
             }
 
@@ -1816,8 +1966,8 @@ jobs:
                       const Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text("QuMatix Deep AI v7.0", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text("5 نماذج ذكاء اصطناعي محلي + تنفيذ سيرفر مباشر", style: TextStyle(fontSize: 10, color: Colors.white60)),
+                          Text("QuMatix Deep AI v8.0", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                          Text("رادار سيولة المتداولين ومصلحة المنصة + الذكاء الاصطناعي", style: TextStyle(fontSize: 9.5, color: Colors.white60)),
                         ],
                       ),
                     ],
@@ -1905,12 +2055,15 @@ jobs:
 
             Widget _buildBotDashboardTab(BuildContext context, QuotexService service) {
               final bool signalReady = service.currentSignalStrength >= _selectedMinStrength;
+              final double totalVol = service.crowdCallVolume + service.crowdPutVolume;
+              final double callRatio = totalVol > 0 ? (service.crowdCallVolume / totalVol) : 0.5;
 
               return SingleChildScrollView(
                 padding: const EdgeInsets.all(16),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // 1. بطاقة الرصيد المباشر وحالة الاتصال
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(18),
@@ -2011,9 +2164,9 @@ jobs:
                                 Text(
                                   service.isTradeOpen
                                       ? "⏳ صفقة جارية (${service.remainingSeconds}s)"
-                                      : "توافق AI: ${service.agreedIndicatorsCount}/5 نماذج",
+                                      : "مصلحة المنصة: ${service.platformFavoredDirection}",
                                   style: TextStyle(
-                                    fontSize: 11.5,
+                                    fontSize: 11,
                                     fontWeight: FontWeight.bold,
                                     color: service.isTradeOpen ? Colors.amberAccent : const Color(0xFF10B981),
                                   ),
@@ -2053,6 +2206,153 @@ jobs:
                     ),
                     const SizedBox(height: 12),
 
+                    // =========================================================================
+                    // 2. البطاقة الجديدة: رادار سيولة الناس ومصلحة المنصة (CALL ضد PUT والفارق $)
+                    // =========================================================================
+                    Container(
+                      padding: const EdgeInsets.all(15),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF111827),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: service.isVolumeDiffReached ? const Color(0xFF10B981) : const Color(0xFF3B82F6),
+                          width: 1.3,
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.groups_rounded, color: Color(0xFFF59E0B), size: 21),
+                                  SizedBox(width: 6),
+                                  Text(
+                                    "رادار دخول الناس ومصلحة المنصة (خلال دقيقة):",
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12.5),
+                                  ),
+                                ],
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: service.isVolumeDiffReached ? const Color(0xFF064E3B) : const Color(0xFF1E293B),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Text(
+                                  "الفارق: \$${service.currentVolumeDiff.toStringAsFixed(0)}",
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.bold,
+                                    color: service.isVolumeDiffReached ? const Color(0xFF34D399) : Colors.amberAccent,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                "دخول الناس CALL: \$${service.crowdCallVolume.toStringAsFixed(0)}",
+                                style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold, fontSize: 12.5),
+                              ),
+                              Text(
+                                "دخول الناس PUT: \$${service.crowdPutVolume.toStringAsFixed(0)}",
+                                style: const TextStyle(color: Color(0xFFEF4444), fontWeight: FontWeight.bold, fontSize: 12.5),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: LinearProgressIndicator(
+                              value: callRatio.clamp(0.05, 0.95),
+                              minHeight: 10,
+                              backgroundColor: const Color(0xFFEF4444),
+                              valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF10B981)),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF0B0F19),
+                              borderRadius: BorderRadius.circular(9),
+                            ),
+                            child: Text(
+                              service.crowdCallVolume > service.crowdPutVolume
+                                  ? "💡 الجمهور متكدس في CALL (\$${service.crowdCallVolume.toStringAsFixed(0)}) -> المنصة ستربّح الأقل: صفقة PUT ⬇"
+                                  : (service.crowdPutVolume > service.crowdCallVolume
+                                      ? "💡 الجمهور متكدس في PUT (\$${service.crowdPutVolume.toStringAsFixed(0)}) -> المنصة ستربّح الأقل: صفقة CALL ⬆"
+                                      : "⏳ جاري رصد تجمّع صفقات المتداولين في الشمعة الحالية..."),
+                              style: const TextStyle(fontSize: 11.5, color: Colors.cyanAccent, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                flex: 3,
+                                child: TextField(
+                                  controller: _diffController,
+                                  keyboardType: TextInputType.number,
+                                  decoration: InputDecoration(
+                                    labelText: "حدد الفارق المطلوب بين CALL و PUT (\$)",
+                                    filled: true,
+                                    fillColor: const Color(0xFF0B0F19),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                                  ),
+                                  onChanged: (_) => _syncSettings(service),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                flex: 2,
+                                child: DropdownButtonFormField<int>(
+                                  value: _selectedCrowdWindow,
+                                  decoration: InputDecoration(
+                                    labelText: "مدة المراقبة",
+                                    filled: true,
+                                    fillColor: const Color(0xFF0B0F19),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(value: 30, child: Text("30 ثانية")),
+                                    DropdownMenuItem(value: 60, child: Text("1 دقيقة")),
+                                    DropdownMenuItem(value: 120, child: Text("2 دقيقتان")),
+                                  ],
+                                  onChanged: (val) {
+                                    setState(() => _selectedCrowdWindow = val!);
+                                    _syncSettings(service);
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              _diffQuickChip(250, "\$250", service),
+                              _diffQuickChip(500, "\$500", service),
+                              _diffQuickChip(1000, "\$1000", service),
+                              _diffQuickChip(1500, "\$1500", service),
+                              _diffQuickChip(2000, "\$2000", service),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 3. بطاقة قياس قوة إشارة الذكاء الاصطناعي المحلي (70% - 95%)
                     Container(
                       padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
@@ -2099,23 +2399,6 @@ jobs:
                               ),
                             ],
                           ),
-                          const SizedBox(height: 10),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(8),
-                            child: LinearProgressIndicator(
-                              value: (service.currentSignalStrength / 100.0).clamp(0.0, 1.0),
-                              minHeight: 9,
-                              backgroundColor: const Color(0xFF0B0F19),
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                signalReady ? const Color(0xFF10B981) : const Color(0xFF3B82F6),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          const Text(
-                            "حدد قوة الإشارة المطلوبة ليرسل الذكاء الاصطناعي الصفقة للسيرفر:",
-                            style: TextStyle(fontSize: 11.5, color: Colors.white70),
-                          ),
                           const SizedBox(height: 8),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -2133,6 +2416,7 @@ jobs:
                     ),
                     const SizedBox(height: 12),
 
+                    // 4. شبكة الإحصائيات الرباعية
                     Row(
                       children: [
                         Expanded(
@@ -2174,6 +2458,7 @@ jobs:
                     ),
                     const SizedBox(height: 12),
 
+                    // 5. إعدادات الاستراتيجية والزوج والتشغيل المباشر
                     Container(
                       padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
@@ -2192,7 +2477,7 @@ jobs:
                                   Icon(Icons.memory_rounded, color: Color(0xFF10B981), size: 20),
                                   SizedBox(width: 8),
                                   Text(
-                                    "محرك الذكاء الاصطناعي والتنفيذ",
+                                    "محرك الاستراتيجية والتنفيذ",
                                     style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
                                   ),
                                 ],
@@ -2211,13 +2496,21 @@ jobs:
                             value: _selectedStrategy,
                             isExpanded: true,
                             decoration: InputDecoration(
-                              labelText: "اختر محرك الذكاء الاصطناعي",
+                              labelText: "اختر استراتيجية التداول الآلي",
                               filled: true,
                               fillColor: const Color(0xFF0B0F19),
                               border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                               contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                             ),
                             items: const [
+                              DropdownMenuItem(
+                                value: "platform_interest_contrarian",
+                                child: Text("مصلحة المنصة: عكس سيولة الجمهور (الأقل دخولاً يربح 💰)"),
+                              ),
+                              DropdownMenuItem(
+                                value: "hybrid_ai_contrarian",
+                                child: Text("مدمج: مصلحة المنصة + الذكاء الاصطناعي العميق معاً 🔥"),
+                              ),
                               DropdownMenuItem(
                                 value: "local_deep_ai",
                                 child: Text("الذكاء الاصطناعي العميق الخماسي (Deep AI Ensemble 🧠)"),
@@ -2371,9 +2664,9 @@ jobs:
                               ),
                               label: Text(
                                 service.isAutoTrading
-                                    ? "إيقاف الذكاء الاصطناعي (ينتظر إشارة بقوة $_selectedMinStrength%+)"
-                                    : "تشغيل التداول الآلي بالذكاء الاصطناعي ($_selectedMinStrength%+)",
-                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                                    ? "إيقاف البوت (يراقب فارق السيولة \$${_diffController.text}+)"
+                                    : "تشغيل التداول الآلي مع مصلحة المنصة (فارق \$${_diffController.text}+)",
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
                               ),
                             ),
                           ),
@@ -2550,6 +2843,34 @@ jobs:
                       ),
                     ),
                   ],
+                ),
+              );
+            }
+
+            Widget _diffQuickChip(int amountVal, String label, QuotexService service) {
+              final selected = (_diffController.text.trim() == amountVal.toString());
+              return GestureDetector(
+                onTap: () {
+                  setState(() => _diffController.text = amountVal.toString());
+                  _syncSettings(service);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: selected ? const Color(0xFF2563EB) : const Color(0xFF0B0F19),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: selected ? const Color(0xFF60A5FA) : Colors.white12,
+                    ),
+                  ),
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                      color: selected ? Colors.white : Colors.white70,
+                    ),
+                  ),
                 ),
               );
             }
