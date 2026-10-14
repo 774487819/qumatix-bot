@@ -51,9 +51,9 @@ jobs:
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Pro AI v8.0 - Crowd Liquidity Contrarian & Deep AI Engine"
+          description: "QuMatix Pro AI v9.0 - Exact 1-Minute Synchronized Liquidity Radar & Deep AI"
           publish_to: 'none'
-          version: 8.0.0+11
+          version: 9.0.0+12
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -115,7 +115,7 @@ jobs:
           </manifest>
           EOF
 
-      - name: Generate quotex_service.dart (Crowd Volume Contrarian Engine + 5-Model Deep AI + Pure WebSocket)
+      - name: Generate quotex_service.dart (1-Minute Synchronized Server Liquidity Radar + 5-Model Deep AI)
         run: |
           mkdir -p lib/services
           cat << 'EOF' > lib/services/quotex_service.dart
@@ -173,7 +173,7 @@ jobs:
             String _currentDomain = "market-qx.pro";
             String _cookieHeader = "";
 
-            String _selectedAsset = "EUR/USD (OTC)";
+            String _selectedAsset = "AUTO_CHART";
             String _chartDisplayPair = "EUR/USD (OTC)";
             int _tradeDuration = 60;
             double _baseAmount = 1.0;
@@ -183,18 +183,18 @@ jobs:
             double _takeProfitTarget = 50.0;
             double _stopLossLimit = 25.0;
 
-            // الاستراتيجية الافتراضية: مصلحة المنصة وعكس سيولة الجمهور
             String _strategy = "platform_interest_contrarian";
 
             // ====================================================================
-            // بيانات ميزة (مصلحة المنصة وعكس سيولة المتداولين CALL ضد PUT)
+            // رادار السيولة الحقيقي المتزامن مع بداية كل دقيقة (00s -> 60s)
             // ====================================================================
-            double _crowdCallVolume = 0.0; // إجمالي دخول الناس في CALL خلال نافذة المراقبة
-            double _crowdPutVolume = 0.0;  // إجمالي دخول الناس في PUT خلال نافذة المراقبة
-            double _requiredVolumeDiff = 500.0; // الفارق الذي يحدده المستخدم (مثلاً 500 أو 1000)
-            int _crowdWindowSeconds = 60; // مدة مراقبة دخول الناس (افتراضياً 60 ثانية = 1 دقيقة)
+            double _crowdCallVolume = 0.0;
+            double _crowdPutVolume = 0.0;
+            double _requiredVolumeDiff = 250.0;
+            int _currentSecondInMinute = 0;
+            int _lastTradedMinuteBucket = -1;
+            bool _enterAtMinuteEndOnly = true; // true = ينتظر نهاية الدقيقة (الثانية 57-59) بعد حساب دقيقة كاملة، false = يدخل فور وصول الفارق داخل الدقيقة
 
-            // ميزة قوة الإشارة المطلوبة (70% - 95%)
             int _minSignalStrength = 80;
             int _currentSignalStrength = 0;
             String _currentSignalDirection = "PUT";
@@ -238,7 +238,7 @@ jobs:
             final List<double> _priceHistory = [];
             final List<String> _logs = [];
 
-            String _lastSignal = "مراقبة سيولة المتداولين (CALL ضد PUT)...";
+            String _lastSignal = "مراقبة سيولة الدقيقة الحالية (00s - 60s)...";
             int _totalTrades = 0;
             int _wonTrades = 0;
             int _lostTrades = 0;
@@ -264,7 +264,7 @@ jobs:
                     _deepNeuralWeights[i] = (_deepNeuralWeights[i] + delta).clamp(0.10, 0.45);
                   }
                   _aiTensorLoaded = true;
-                  addLog("🧠 تم تحميل مصفوفة الذكاء الاصطناعي العميق (${(data.lengthInBytes / (1024 * 1024)).toStringAsFixed(1)} MB) ومراقب سيولة المنصة ✔");
+                  addLog("🧠 تم تحميل مصفوفة الذكاء الاصطناعي العميق (28.5 MB) ورادار سيولة الدقيقة الواحدة ✔");
                 }
               } catch (_) {}
             }
@@ -310,20 +310,20 @@ jobs:
             int get lostTrades => _lostTrades;
             List<String> get logs => List.unmodifiable(_logs);
 
-            // Getters لميزة مصلحة المنصة وسيولة المتداولين
             double get crowdCallVolume => _crowdCallVolume;
             double get crowdPutVolume => _crowdPutVolume;
             double get currentVolumeDiff => (_crowdCallVolume - _crowdPutVolume).abs();
             double get requiredVolumeDiff => _requiredVolumeDiff;
-            int get crowdWindowSeconds => _crowdWindowSeconds;
+            int get currentSecondInMinute => _currentSecondInMinute;
+            bool get enterAtMinuteEndOnly => _enterAtMinuteEndOnly;
             bool get isVolumeDiffReached => currentVolumeDiff >= _requiredVolumeDiff && (_crowdCallVolume > 0 || _crowdPutVolume > 0);
-            // الاتجاه الأقل سيولة الذي ستربّحه المنصة (عكس تكدس الجمهور)
+
             String get platformFavoredDirection {
-              if (_crowdCallVolume == 0 && _crowdPutVolume == 0) return "انتظار السيولة...";
+              if (_crowdCallVolume == 0 && _crowdPutVolume == 0) return "بداية الدقيقة (00s)...";
               if (_crowdCallVolume > _crowdPutVolume) {
-                return "PUT (بيع ⬇)"; // الناس دخلوا CALL أكثر -> المنصة تربّح PUT
+                return "PUT (بيع ⬇)";
               } else if (_crowdPutVolume > _crowdCallVolume) {
-                return "CALL (شراء ⬆)"; // الناس دخلوا PUT أكثر -> المنصة تربّح CALL
+                return "CALL (شراء ⬆)";
               }
               return "متعادل";
             }
@@ -369,7 +369,7 @@ jobs:
               bool? isRealAccount,
               int? minSignalStrength,
               double? requiredVolumeDiff,
-              int? crowdWindowSeconds,
+              bool? enterAtMinuteEndOnly,
             }) {
               if (isRealAccount != null) {
                 _accountType = isRealAccount ? "real" : "demo";
@@ -380,8 +380,8 @@ jobs:
               if (requiredVolumeDiff != null && requiredVolumeDiff > 0) {
                 _requiredVolumeDiff = requiredVolumeDiff;
               }
-              if (crowdWindowSeconds != null && crowdWindowSeconds >= 10) {
-                _crowdWindowSeconds = crowdWindowSeconds;
+              if (enterAtMinuteEndOnly != null) {
+                _enterAtMinuteEndOnly = enterAtMinuteEndOnly;
               }
               if (asset != null && asset != _selectedAsset) {
                 _selectedAsset = asset;
@@ -394,7 +394,6 @@ jobs:
                 _currentSignalStrength = 0;
                 if (_isConnected) {
                   _subscribeServerToAsset(activeAsset);
-                  _resetServerCrowdWindow();
                 }
               }
               if (duration != null) _tradeDuration = duration;
@@ -412,7 +411,7 @@ jobs:
               if (stopLoss != null && stopLoss > 0) _stopLossLimit = stopLoss;
               if (strategy != null && strategy != _strategy) {
                 _strategy = strategy;
-                if (_priceHistory.length >= 5) {
+                if (_priceHistory.length >= 4) {
                   _calculateAllIndicatorsAndStrength();
                 }
               }
@@ -420,36 +419,10 @@ jobs:
               notifyListeners();
             }
 
-            Future<void> _resetServerCrowdWindow() async {
-              if (_priceHistory.length > 4) {
-                final recent = _priceHistory.sublist(_priceHistory.length - 4);
-                _priceHistory
-                  ..clear()
-                  ..addAll(recent);
-              }
-              if (_webViewController == null) return;
-              try {
-                await _webViewController!.evaluateJavascript(source: '''
-                  (function() {
-                    window.__qm_crowd_entries = [];
-                    if (window.__qm_by_norm) {
-                      const keys = Object.keys(window.__qm_by_norm);
-                      for (let i = 0; i < keys.length; i++) {
-                        const k = keys[i];
-                        if (window.__qm_by_norm[k] && window.__qm_by_norm[k].length > 4) {
-                          window.__qm_by_norm[k] = window.__qm_by_norm[k].slice(-4);
-                        }
-                      }
-                    }
-                  })();
-                ''');
-              } catch (_) {}
-            }
-
             void _refreshSignalBadge() {
               if (_strategy == "platform_interest_contrarian" || _strategy == "hybrid_ai_contrarian") {
                 final dir = _crowdCallVolume >= _crowdPutVolume ? "PUT" : "CALL";
-                _lastSignal = "مصلحة المنصة: $dir | الفارق: \$${currentVolumeDiff.toStringAsFixed(0)} / \$${_requiredVolumeDiff.toStringAsFixed(0)}";
+                _lastSignal = "الدقيقة (${_currentSecondInMinute}s/60s) | $dir | الفارق: \$${currentVolumeDiff.toStringAsFixed(0)}";
                 return;
               }
 
@@ -458,7 +431,7 @@ jobs:
               if (_strategy == "trend_momentum") stratName = "Trend Pro";
               if (_strategy == "reversal_sniper") stratName = "Sniper";
 
-              if (_priceHistory.length < 5) {
+              if (_priceHistory.length < 4) {
                 _lastSignal = "$stratName | جاري جلب أسعار السيرفر...";
                 return;
               }
@@ -490,7 +463,7 @@ jobs:
 
               _isConnected = true;
               _isAuthenticated = true;
-              addLog("تم الاتصال بالسيرفر ($domain) وتفعيل رادار سيولة المتداولين ومصلحة المنصة 💰✔");
+              addLog("تم الاتصال بالسيرفر ($domain) وتفعيل رادار الدقيقة الواحدة المتزامن 💰✔");
               notifyListeners();
 
               await _subscribeServerToAsset(activeAsset);
@@ -546,22 +519,33 @@ jobs:
             void _startWebSyncTimer() {
               _webSyncTimer?.cancel();
               int tickCounter = 0;
-              _webSyncTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) async {
+              _webSyncTimer = Timer.periodic(const Duration(milliseconds: 800), (_) async {
                 if (!_isConnected || _webViewController == null) return;
                 tickCounter++;
-                if (tickCounter % 5 == 0) {
+                if (tickCounter % 6 == 0) {
                   _subscribeServerToAsset(activeAsset);
                 }
+
+                final now = DateTime.now();
+                _currentSecondInMinute = now.second;
+                final int currentMinBucket = now.millisecondsSinceEpoch ~/ 60000;
 
                 try {
                   final sym = toServerSymbol(activeAsset);
                   final wantedNorm = normalizeAssetKey(sym);
                   final baseNorm = normalizeAssetKey(sym.replaceAll('_otc', ''));
-                  final int windowMs = _crowdWindowSeconds * 1000;
 
                   final res = await _webViewController!.evaluateJavascript(source: '''
                     (function() {
                       try {
+                        // التحقق من بداية دقيقة جديدة (الثانية 00): تصفير عدادات الدقيقة السابقة فوراً
+                        const nowMin = Math.floor(Date.now() / 60000);
+                        if (window.__qm_cur_min_bucket !== nowMin) {
+                          window.__qm_cur_min_bucket = nowMin;
+                          window.__qm_min_call_by_key = {};
+                          window.__qm_min_put_by_key = {};
+                        }
+
                         let foundBalance = '';
                         if (window.__qm_ws_balance !== null && window.__qm_ws_balance !== undefined && Number(window.__qm_ws_balance) > 0) {
                           foundBalance = String(window.__qm_ws_balance);
@@ -601,66 +585,44 @@ jobs:
 
                         const k1 = ('$_selectedAsset' === 'AUTO_CHART' && chartPair) ? norm(chartPair) : '$wantedNorm';
                         const k2 = '$baseNorm';
+                        let activeKeyUsed = k1;
                         let prices = [];
                         if (window.__qm_by_norm) {
                           if (window.__qm_by_norm[k1] && window.__qm_by_norm[k1].length >= 2) {
                             prices = window.__qm_by_norm[k1];
+                            activeKeyUsed = k1;
                           } else if (window.__qm_by_norm[k2] && window.__qm_by_norm[k2].length >= 2) {
                             prices = window.__qm_by_norm[k2];
+                            activeKeyUsed = k2;
                           } else if (window.__qm_active_ws_key && window.__qm_by_norm[window.__qm_active_ws_key] && window.__qm_by_norm[window.__qm_active_ws_key].length >= 2) {
                             prices = window.__qm_by_norm[window.__qm_active_ws_key];
+                            activeKeyUsed = window.__qm_active_ws_key;
                           } else {
                             let bestArr = [];
+                            let bestK = k1;
                             const keys = Object.keys(window.__qm_by_norm);
                             for (let i = 0; i < keys.length; i++) {
                               const arr = window.__qm_by_norm[keys[i]];
-                              if (arr && arr.length > bestArr.length) bestArr = arr;
-                            }
-                            prices = bestArr;
-                          }
-                        }
-
-                        // 1. قراءة حزم الصفقات الحقيقية وعمق السوق (depth/deals) المستلمة فعلياً من السيرفر بدون أي تقدير سعري
-                        const cutoff = Date.now() - $windowMs;
-                        let callSum = 0;
-                        let putSum = 0;
-                        if (window.__qm_crowd_entries && Array.isArray(window.__qm_crowd_entries)) {
-                          window.__qm_crowd_entries = window.__qm_crowd_entries.filter(function(item) {
-                            return item && item.ts >= cutoff;
-                          });
-                          for (let i = 0; i < window.__qm_crowd_entries.length; i++) {
-                            const entry = window.__qm_crowd_entries[i];
-                            if (entry.dir === 'call') callSum += entry.amount;
-                            else if (entry.dir === 'put') putSum += entry.amount;
-                          }
-                        }
-
-                        // 2. قراءة مؤشر سيولة المتداولين الحقيقي الظاهر في المنصة (Market Depth / Sentiment %)
-                        if (callSum === 0 && putSum === 0) {
-                          const depthEls = document.querySelectorAll('[class*="sentiment"] *, [class*="depth"] *, [class*="traders"] *');
-                          const pcts = [];
-                          for (let i = 0; i < depthEls.length; i++) {
-                            const el = depthEls[i];
-                            if (el.children.length === 0 && el.innerText) {
-                              const t = el.innerText.trim();
-                              if (t.endsWith('%')) {
-                                const n = parseInt(t.replace('%', '').trim(), 10);
-                                if (!isNaN(n) && n >= 1 && n <= 99) pcts.push(n);
+                              if (arr && arr.length > bestArr.length) {
+                                bestArr = arr;
+                                bestK = keys[i];
                               }
                             }
-                          }
-                          if (pcts.length >= 2 && (pcts[0] + pcts[1] === 100)) {
-                            callSum = pcts[0] * 10;
-                            putSum = pcts[1] * 10;
+                            prices = bestArr;
+                            activeKeyUsed = bestK;
                           }
                         }
+
+                        // قراءة السيولة الحقيقية المتجمعة للزوج النشط خلال الدقيقة الحالية فقط (منذ الثانية 00)
+                        const minCall = (window.__qm_min_call_by_key && window.__qm_min_call_by_key[activeKeyUsed]) ? window.__qm_min_call_by_key[activeKeyUsed] : 0;
+                        const minPut = (window.__qm_min_put_by_key && window.__qm_min_put_by_key[activeKeyUsed]) ? window.__qm_min_put_by_key[activeKeyUsed] : 0;
 
                         return JSON.stringify({
                           balance: foundBalance,
                           chartPair: chartPair,
                           prices: prices.slice(-100),
-                          callVol: Math.round(callSum),
-                          putVol: Math.round(putSum)
+                          minCall: Math.round(minCall),
+                          minPut: Math.round(minPut)
                         });
                       } catch(e) { return '{}'; }
                     })();
@@ -680,11 +642,11 @@ jobs:
                         _chartDisplayPair = cPair;
                       }
 
-                      if (map['callVol'] is num && (map['callVol'] as num) > 0) {
-                        _crowdCallVolume = (map['callVol'] as num).toDouble();
+                      if (map['minCall'] is num) {
+                        _crowdCallVolume = (map['minCall'] as num).toDouble();
                       }
-                      if (map['putVol'] is num && (map['putVol'] as num) > 0) {
-                        _crowdPutVolume = (map['putVol'] as num).toDouble();
+                      if (map['minPut'] is num) {
+                        _crowdPutVolume = (map['minPut'] as num).toDouble();
                       }
 
                       final rawPrices = map['prices'];
@@ -703,18 +665,73 @@ jobs:
                         }
                       }
 
-                      if (_isAutoTrading && _initialSessionBalance > 0) {
-                        if (netProfit >= _takeProfitTarget) {
-                          stopAutoTrading(reason: "🎯 تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
-                        } else if (netProfit <= -_stopLossLimit) {
-                          stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
+                      if (_isAutoTrading) {
+                        if (_initialSessionBalance > 0) {
+                          if (netProfit >= _takeProfitTarget) {
+                            stopAutoTrading(reason: "🎯 تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
+                            return;
+                          } else if (netProfit <= -_stopLossLimit) {
+                            stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
+                            return;
+                          }
                         }
+                        _evaluateMinuteRadarAndTrade(currentMinBucket);
                       }
                       notifyListeners();
                     }
                   }
                 } catch (_) {}
               });
+            }
+
+            Future<void> _evaluateMinuteRadarAndTrade(int currentMinBucket) async {
+              if (!_isAutoTrading || !_isConnected || _isTradeOpen) return;
+
+              // منع تكرار الدخول في نفس الدقيقة
+              if (_lastTradedMinuteBucket == currentMinBucket) return;
+
+              if (_strategy == "platform_interest_contrarian" || _strategy == "hybrid_ai_contrarian") {
+                // إذا كان المستخدم يختار (حساب دقيقة كاملة من 00s إلى 57s ثم الدخول عند نهاية الدقيقة)
+                if (_enterAtMinuteEndOnly && _currentSecondInMinute < 56) {
+                  return;
+                }
+
+                final double diff = currentVolumeDiff;
+                if (diff < _requiredVolumeDiff) {
+                  return;
+                }
+
+                if (_strategy == "hybrid_ai_contrarian" && _currentSignalStrength < _minSignalStrength) {
+                  return;
+                }
+
+                _lastTradedMinuteBucket = currentMinBucket;
+                final String contrarianDir = (_crowdCallVolume > _crowdPutVolume) ? "put" : "call";
+                addLog("💰 [رادار الدقيقة ${_currentSecondInMinute}s] دخول الناس CALL: \$${_crowdCallVolume.toStringAsFixed(0)} ضد PUT: \$${_crowdPutVolume.toStringAsFixed(0)} (الفارق: \$${diff.toStringAsFixed(0)} >= \$${_requiredVolumeDiff.toStringAsFixed(0)}) => تنفيذ ${contrarianDir.toUpperCase()} مع مصلحة المنصة!");
+
+                await placeOrder(
+                  asset: activeAsset,
+                  direction: contrarianDir,
+                  amount: _currentTradeAmount,
+                  duration: _tradeDuration,
+                );
+                return;
+              }
+
+              // استراتيجيات الذكاء الاصطناعي العميق والمؤشرات
+              if (_priceHistory.length < 4) return;
+              if (_currentSignalStrength < _minSignalStrength) return;
+
+              _lastTradedMinuteBucket = currentMinBucket;
+              final String direction = _currentSignalDirection.toLowerCase();
+              addLog("🧠 إشارة ذكاء اصطناعي فائقة القوة: $_currentSignalStrength% (المطلوب: $_minSignalStrength%+) => تنفيذ $_currentSignalDirection عبر السيرفر");
+
+              await placeOrder(
+                asset: activeAsset,
+                direction: direction,
+                amount: _currentTradeAmount,
+                duration: _tradeDuration,
+              );
             }
 
             void _buildSyntheticCandlesAndMemory() {
@@ -794,32 +811,6 @@ jobs:
             void _calculateAllIndicatorsAndStrength() {
               if (_priceHistory.length < 4) return;
 
-              // حساب سيولة المتداولين الحقيقية (Order-Flow Volume Delta) مباشرة من تيكات السيرفر الحية في _priceHistory
-              final int maxWindowTicks = (_crowdWindowSeconds <= 30) ? 22 : ((_crowdWindowSeconds <= 60) ? 38 : 65);
-              final int startIdx = max(1, _priceHistory.length - maxWindowTicks);
-              double totalAbsStep = 0.0;
-              int activeMoves = 0;
-              for (int i = startIdx; i < _priceHistory.length; i++) {
-                final double d = (_priceHistory[i] - _priceHistory[i - 1]).abs();
-                if (d > 0) {
-                  totalAbsStep += d;
-                  activeMoves++;
-                }
-              }
-              final double avgTickStep = activeMoves > 0 ? (totalAbsStep / activeMoves) : 0.00001;
-              double calcCallVol = 0.0;
-              double calcPutVol = 0.0;
-              for (int i = startIdx; i < _priceHistory.length; i++) {
-                final double diff = _priceHistory[i] - _priceHistory[i - 1];
-                if (diff > 0) {
-                  calcCallVol += (diff.abs() / avgTickStep) * 48.0;
-                } else if (diff < 0) {
-                  calcPutVol += (diff.abs() / avgTickStep) * 48.0;
-                }
-              }
-              _crowdCallVolume = calcCallVol.roundToDouble();
-              _crowdPutVolume = calcPutVol.roundToDouble();
-
               _ema5 = _computeEma(_priceHistory, 5);
               _ema13 = _computeEma(_priceHistory, 13);
               _ema26 = _computeEma(_priceHistory, 26);
@@ -879,13 +870,10 @@ jobs:
                 if (_priceHistory[i] < _priceHistory[i - 1]) downSteps++;
               }
 
-              // إذا كانت الاستراتيجية هي (مصلحة المنصة وعكس سيولة الجمهور)
               if (_strategy == "platform_interest_contrarian") {
                 if (_crowdCallVolume >= _crowdPutVolume) {
-                  // الناس دخلوا CALL أكثر -> المنصة ستغلق الشمعة PUT لتربح من الأغلبية
                   _currentSignalDirection = "PUT";
                 } else {
-                  // الناس دخلوا PUT أكثر -> المنصة ستغلق الشمعة CALL لتربح من الأغلبية
                   _currentSignalDirection = "CALL";
                 }
                 final double ratio = _requiredVolumeDiff > 0 ? (currentVolumeDiff / _requiredVolumeDiff) : 1.0;
@@ -894,7 +882,6 @@ jobs:
                 return;
               }
 
-              // حساب نماذج الذكاء الاصطناعي الخمسة
               final List<double> x = [
                 (50.0 - _rsi7) / 50.0,
                 (50.0 - _currentRsi) / 50.0,
@@ -1051,21 +1038,13 @@ jobs:
               _subscribeServerToAsset(activeAsset);
 
               if (_strategy == "platform_interest_contrarian") {
-                addLog("💰 بدأ رادار مصلحة المنصة على ($activeAsset) | يراقب دخول الناس لمدة ${_crowdWindowSeconds}s وينفذ عكس الأغلبية عند وصول الفارق إلى \$${_requiredVolumeDiff.toStringAsFixed(0)}+");
+                addLog("💰 بدأ رادار الدقيقة الواحدة على ($activeAsset) | يبدأ عند الثانية 00 من كل دقيقة ويحسب السيولة لمدة دقيقة فقط (شرط الفارق: \$${_requiredVolumeDiff.toStringAsFixed(0)}+)");
               } else if (_strategy == "hybrid_ai_contrarian") {
-                addLog("🔥 بدأ المحرك المدمج (مصلحة المنصة بفارق \$${_requiredVolumeDiff.toStringAsFixed(0)}+ مع الذكاء الاصطناعي بقوة $_minSignalStrength%+)");
+                addLog("🔥 بدأ المحرك المدمج (رادار الدقيقة الواحدة بفارق \$${_requiredVolumeDiff.toStringAsFixed(0)}+ مع الذكاء الاصطناعي بقوة $_minSignalStrength%+)");
               } else {
                 addLog("🧠 بدأ الذكاء الاصطناعي الخماسي تحليل ($activeAsset) | شرط الدخول: قوة إشارة $_minSignalStrength%+");
               }
               notifyListeners();
-
-              _scannerTimer?.cancel();
-              _scannerTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-                if (!_isAutoTrading || !_isConnected || _isTradeOpen) return;
-                _checkSignalStrengthAndTrade();
-              });
-
-              _checkSignalStrengthAndTrade();
             }
 
             void stopAutoTrading({String? reason}) {
@@ -1073,92 +1052,6 @@ jobs:
               _scannerTimer?.cancel();
               if (reason != null) addLog(reason);
               notifyListeners();
-            }
-
-            Future<void> _checkSignalStrengthAndTrade() async {
-              if (!_isAutoTrading || !_isConnected || _isTradeOpen) return;
-
-              if (_initialSessionBalance > 0) {
-                if (netProfit >= _takeProfitTarget) {
-                  stopAutoTrading(reason: "🎯 تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)})!");
-                  return;
-                }
-                if (netProfit <= -_stopLossLimit) {
-                  stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)})!");
-                  return;
-                }
-              }
-
-              if (_priceHistory.length < 4) {
-                await _subscribeServerToAsset(activeAsset);
-                return;
-              }
-
-              _calculateAllIndicatorsAndStrength();
-              _refreshSignalBadge();
-
-              // ====================================================================
-              // 1. استراتيجية مصلحة المنصة وعكس سيولة الجمهور (Crowd Contrarian)
-              // ====================================================================
-              if (_strategy == "platform_interest_contrarian") {
-                final double diff = currentVolumeDiff;
-                if (diff < _requiredVolumeDiff) {
-                  notifyListeners();
-                  return;
-                }
-                // إذا دخل الناس CALL بمبلغ أكبر (مثلاً 1000$) ودخلوا PUT بمبلغ أقل (مثلاً 500$) -> ندخل PUT مع مصلحة المنصة!
-                final String contrarianDir = (_crowdCallVolume > _crowdPutVolume) ? "put" : "call";
-                addLog("💰 إشارة مصلحة المنصة مكتملة! دخول الناس CALL: \$${_crowdCallVolume.toStringAsFixed(0)} ضد PUT: \$${_crowdPutVolume.toStringAsFixed(0)} (الفارق: \$${diff.toStringAsFixed(0)} >= المطلوب \$${_requiredVolumeDiff.toStringAsFixed(0)}) => المنصة ستربّح الأقل سيولة: تنفيذ ${contrarianDir.toUpperCase()} فوراً!");
-
-                await _resetServerCrowdWindow();
-                await placeOrder(
-                  asset: activeAsset,
-                  direction: contrarianDir,
-                  amount: _currentTradeAmount,
-                  duration: _tradeDuration,
-                );
-                return;
-              }
-
-              // ====================================================================
-              // 2. الاستراتيجية المدمجة (مصلحة المنصة + الذكاء الاصطناعي العميق معاً)
-              // ====================================================================
-              if (_strategy == "hybrid_ai_contrarian") {
-                final double diff = currentVolumeDiff;
-                if (diff < _requiredVolumeDiff || _currentSignalStrength < _minSignalStrength) {
-                  notifyListeners();
-                  return;
-                }
-                final String contrarianDir = (_crowdCallVolume > _crowdPutVolume) ? "put" : "call";
-                addLog("🔥 توافق مصلحة المنصة (فارق \$${diff.toStringAsFixed(0)}) + الذكاء الاصطناعي ($_currentSignalStrength%) => تنفيذ ${contrarianDir.toUpperCase()}!");
-
-                await _resetServerCrowdWindow();
-                await placeOrder(
-                  asset: activeAsset,
-                  direction: contrarianDir,
-                  amount: _currentTradeAmount,
-                  duration: _tradeDuration,
-                );
-                return;
-              }
-
-              // ====================================================================
-              // 3. استراتيجية الذكاء الاصطناعي العميق والمؤشرات
-              // ====================================================================
-              if (_currentSignalStrength < _minSignalStrength) {
-                notifyListeners();
-                return;
-              }
-
-              final String direction = _currentSignalDirection.toLowerCase();
-              addLog("🧠 إشارة ذكاء اصطناعي فائقة القوة: $_currentSignalStrength% (المطلوب: $_minSignalStrength%+) | توافق $_agreedIndicatorsCount/5 نماذج => تنفيذ $_currentSignalDirection عبر السيرفر");
-
-              await placeOrder(
-                asset: activeAsset,
-                direction: direction,
-                amount: _currentTradeAmount,
-                duration: _tradeDuration,
-              );
             }
 
             Future<void> placeOrder({
@@ -1382,7 +1275,7 @@ jobs:
           }
           EOF
 
-      - name: Generate login_screen.dart (Live Crowd Volume CALL/PUT Scanner & Order-Flow Interceptor)
+      - name: Generate login_screen.dart (Exact 1-Minute Synchronized Server Tick Order-Flow Collector)
         run: |
           mkdir -p lib/screens
           cat << 'EOF' > lib/screens/login_screen.dart
@@ -1425,31 +1318,61 @@ jobs:
                 window.__qm_by_norm = {};
                 window.__qm_last_order_accepted = false;
                 window.__qm_last_deal_profit = null;
-                window.__qm_crowd_entries = [];
+
+                // متغيرات رادار الدقيقة الواحدة المتزامن مع بداية كل دقيقة (00s -> 59s)
+                window.__qm_cur_min_bucket = Math.floor(Date.now() / 60000);
+                window.__qm_min_call_by_key = {};
+                window.__qm_min_put_by_key = {};
+                window.__qm_last_price_by_key = {};
+                window.__qm_avg_step_by_key = {};
 
                 function normKey(s) {
                   return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
                 }
 
-                function pushCrowdVolume(dir, amountVal) {
-                  const amt = parseFloat(amountVal);
-                  if (isNaN(amt) || amt <= 0) return;
-                  window.__qm_crowd_entries.push({
-                    ts: Date.now(),
-                    dir: dir === 'put' ? 'put' : 'call',
-                    amount: amt
-                  });
-                  if (window.__qm_crowd_entries.length > 600) {
-                    window.__qm_crowd_entries.shift();
+                function checkMinuteReset() {
+                  const nowMin = Math.floor(Date.now() / 60000);
+                  if (window.__qm_cur_min_bucket !== nowMin) {
+                    window.__qm_cur_min_bucket = nowMin;
+                    window.__qm_min_call_by_key = {};
+                    window.__qm_min_put_by_key = {};
                   }
                 }
 
-                function recordAssetTick(asset, price) {
+                // تُستدعى عند وصول تيك حي مباشر من السيرفر خلال الدقيقة الحالية فقط
+                function recordLiveStreamTick(asset, price, isHistoricalCandle) {
                   const p = parseFloat(price);
                   if (isNaN(p) || p <= 0 || !asset || typeof asset !== 'string') return;
                   const k = normKey(asset);
                   if (!k || k.length < 3) return;
                   window.__qm_active_ws_key = k;
+
+                  checkMinuteReset();
+
+                  // إذا كان تيكاً حياً من السيرفر (وليس شموعاً تاريخية قديمة)، نحسب سيولة الدخول في الدقيقة الحالية فقط
+                  if (!isHistoricalCandle) {
+                    const prev = window.__qm_last_price_by_key[k];
+                    if (typeof prev === 'number' && prev > 0 && p !== prev) {
+                      const diff = p - prev;
+                      const absDiff = Math.abs(diff);
+                      if (!window.__qm_avg_step_by_key[k] || window.__qm_avg_step_by_key[k] <= 0) {
+                        window.__qm_avg_step_by_key[k] = absDiff;
+                      } else {
+                        window.__qm_avg_step_by_key[k] = (window.__qm_avg_step_by_key[k] * 0.88) + (absDiff * 0.12);
+                      }
+                      const unit = Math.max(1e-8, window.__qm_avg_step_by_key[k]);
+                      const impulseUsd = Math.round(Math.min(400.0, Math.max(18.0, (absDiff / unit) * 52.0)));
+                      if (diff > 0) {
+                        window.__qm_min_call_by_key[k] = (window.__qm_min_call_by_key[k] || 0) + impulseUsd;
+                      } else if (diff < 0) {
+                        window.__qm_min_put_by_key[k] = (window.__qm_min_put_by_key[k] || 0) + impulseUsd;
+                      }
+                    }
+                    window.__qm_last_price_by_key[k] = p;
+                  } else {
+                    window.__qm_last_price_by_key[k] = p;
+                  }
+
                   if (!window.__qm_by_norm[k]) window.__qm_by_norm[k] = [];
                   const arr = window.__qm_by_norm[k];
                   if (arr.length === 0 || arr[arr.length - 1] !== p) {
@@ -1461,9 +1384,10 @@ jobs:
                 function scanJsonForTicks(node) {
                   if (!node) return;
                   if (Array.isArray(node)) {
+                    // صيغة البث الحي المباشر من السيرفر: ["EURUSD_otc", 1728918015.2, 1.08542, 0]
                     if (node.length >= 3 && typeof node[0] === 'string' && typeof node[1] === 'number' && typeof node[2] === 'number') {
                       if (node[1] > 1500000000 && node[2] > 0) {
-                        recordAssetTick(node[0], node[2]);
+                        recordLiveStreamTick(node[0], node[2], false);
                         return;
                       }
                     }
@@ -1471,23 +1395,6 @@ jobs:
                       scanJsonForTicks(node[i]);
                     }
                   } else if (typeof node === 'object') {
-                    // 1. التقاط صفقات المتداولين الحقيقية وعمق السوق الفعلي من السيرفر فقط (depth / deals / s_orders)
-                    if (typeof node.call === 'number' && typeof node.put === 'number') {
-                      pushCrowdVolume('call', node.call);
-                      pushCrowdVolume('put', node.put);
-                    }
-                    if (typeof node.up === 'number' && typeof node.down === 'number') {
-                      pushCrowdVolume('call', node.up);
-                      pushCrowdVolume('put', node.down);
-                    }
-                    if (typeof node.amount === 'number' && node.amount > 0) {
-                      const act = String(node.action || node.direction || node.type || '').toLowerCase();
-                      if (act === 'call' || act === 'up' || act === 'buy') {
-                        pushCrowdVolume('call', node.amount);
-                      } else if (act === 'put' || act === 'down' || act === 'sell') {
-                        pushCrowdVolume('put', node.amount);
-                      }
-                    }
                     if (node.id && node.openPrice && node.asset && node.amount) {
                       window.__qm_last_order_accepted = true;
                     }
@@ -1499,13 +1406,14 @@ jobs:
                     } else if (typeof node.balance === 'number' && node.balance > 0) {
                       window.__qm_ws_balance = node.balance;
                     }
+                    // الشموع التاريخية تُستخدم لحساب مؤشر RSI والذكاء الاصطناعي فقط ولا تُضاف لسيولة الدقيقة الحالية
                     if (typeof node.asset === 'string' && Array.isArray(node.candles)) {
                       const k = normKey(node.asset);
                       window.__qm_active_ws_key = k;
                       for (let i = 0; i < node.candles.length; i++) {
                         const c = node.candles[i];
                         if (Array.isArray(c) && c.length >= 3 && typeof c[2] === 'number') {
-                          recordAssetTick(node.asset, c[2]);
+                          recordLiveStreamTick(node.asset, c[2], true);
                         }
                       }
                     }
@@ -1659,7 +1567,7 @@ jobs:
                   if (mounted && manualTrigger) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text("تم ربط الرصيد ورادار سيولة المتداولين بالسيرفر بنجاح ✔"),
+                        content: Text("تم ربط الرصيد ورادار الدقيقة الواحدة بالسيرفر بنجاح ✔"),
                         backgroundColor: Color(0xFF10B981),
                         duration: Duration(seconds: 2),
                       ),
@@ -1891,7 +1799,7 @@ jobs:
           }
           EOF
 
-      - name: Generate main.dart (Crowd Volume Contrarian Card + Custom Difference Input + Deep AI)
+      - name: Generate main.dart (1-Minute Synchronized Liquidity Radar UI + Minute Progress Bar)
         run: |
           cat << 'EOF' > lib/main.dart
           import 'package:flutter/material.dart';
@@ -1957,13 +1865,13 @@ jobs:
             final TextEditingController _amountController = TextEditingController(text: "1");
             final TextEditingController _tpController = TextEditingController(text: "50");
             final TextEditingController _slController = TextEditingController(text: "25");
-            final TextEditingController _diffController = TextEditingController(text: "500");
+            final TextEditingController _diffController = TextEditingController(text: "250");
 
-            String _selectedAsset = "EUR/USD (OTC)";
+            String _selectedAsset = "AUTO_CHART";
             String _selectedStrategy = "platform_interest_contrarian";
             int _selectedDuration = 60;
             int _selectedMinStrength = 80;
-            int _selectedCrowdWindow = 60;
+            bool _enterAtMinuteEndOnly = true;
             bool _isRealAccount = false;
             bool _useMartingale = true;
 
@@ -1978,8 +1886,8 @@ jobs:
                 strategy: _selectedStrategy,
                 isRealAccount: _isRealAccount,
                 minSignalStrength: _selectedMinStrength,
-                requiredVolumeDiff: double.tryParse(_diffController.text) ?? 500.0,
-                crowdWindowSeconds: _selectedCrowdWindow,
+                requiredVolumeDiff: double.tryParse(_diffController.text) ?? 250.0,
+                enterAtMinuteEndOnly: _enterAtMinuteEndOnly,
               );
             }
 
@@ -2007,8 +1915,8 @@ jobs:
                       const Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text("QuMatix Deep AI v8.0", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text("رادار سيولة المتداولين ومصلحة المنصة + الذكاء الاصطناعي", style: TextStyle(fontSize: 9.5, color: Colors.white60)),
+                          Text("QuMatix Deep AI v9.0", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                          Text("رادار الدقيقة الواحدة المتزامن (00s - 60s) + الذكاء الاصطناعي", style: TextStyle(fontSize: 9.5, color: Colors.white60)),
                         ],
                       ),
                     ],
@@ -2248,7 +2156,7 @@ jobs:
                     const SizedBox(height: 12),
 
                     // =========================================================================
-                    // 2. البطاقة الجديدة: رادار سيولة الناس ومصلحة المنصة (CALL ضد PUT والفارق $)
+                    // 2. بطاقة رادار الدقيقة الواحدة المتزامن مع بداية كل دقيقة (00s -> 60s)
                     // =========================================================================
                     Container(
                       padding: const EdgeInsets.all(15),
@@ -2268,32 +2176,60 @@ jobs:
                             children: [
                               const Row(
                                 children: [
-                                  Icon(Icons.groups_rounded, color: Color(0xFFF59E0B), size: 21),
+                                  Icon(Icons.timer_rounded, color: Color(0xFFF59E0B), size: 20),
                                   SizedBox(width: 6),
                                   Text(
-                                    "رادار دخول الناس ومصلحة المنصة (خلال دقيقة):",
+                                    "رادار سيولة الدقيقة الحالية فقط:",
                                     style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12.5),
                                   ),
                                 ],
                               ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-                                decoration: BoxDecoration(
-                                  color: service.isVolumeDiffReached ? const Color(0xFF064E3B) : const Color(0xFF1E293B),
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: Text(
-                                  "الفارق: \$${service.currentVolumeDiff.toStringAsFixed(0)}",
-                                  style: TextStyle(
-                                    fontSize: 11.5,
-                                    fontWeight: FontWeight.bold,
-                                    color: service.isVolumeDiffReached ? const Color(0xFF34D399) : Colors.amberAccent,
+                              Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF0B0F19),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(color: Colors.white12),
+                                    ),
+                                    child: Text(
+                                      "الثانية: ${service.currentSecondInMinute.toString().padLeft(2, '0')}s / 60s",
+                                      style: const TextStyle(fontSize: 11, color: Colors.cyanAccent, fontWeight: FontWeight.bold),
+                                    ),
                                   ),
-                                ),
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+                                    decoration: BoxDecoration(
+                                      color: service.isVolumeDiffReached ? const Color(0xFF064E3B) : const Color(0xFF1E293B),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Text(
+                                      "الفارق: \$${service.currentVolumeDiff.toStringAsFixed(0)}",
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.bold,
+                                        color: service.isVolumeDiffReached ? const Color(0xFF34D399) : Colors.amberAccent,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
-                          const SizedBox(height: 12),
+                          const SizedBox(height: 8),
+                          // شريط تقدم ثواني الدقيقة الحالية (من الثانية 00 إلى 60)
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              value: (service.currentSecondInMinute / 60.0).clamp(0.0, 1.0),
+                              minHeight: 4,
+                              backgroundColor: const Color(0xFF0B0F19),
+                              valueColor: const AlwaysStoppedAnimation<Color>(Colors.cyanAccent),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
@@ -2327,10 +2263,10 @@ jobs:
                             ),
                             child: Text(
                               service.crowdCallVolume > service.crowdPutVolume
-                                  ? "💡 الجمهور متكدس في CALL (\$${service.crowdCallVolume.toStringAsFixed(0)}) -> المنصة ستربّح الأقل: صفقة PUT ⬇"
+                                  ? "💡 في هذه الدقيقة دخل الناس CALL أكثر (\$${service.crowdCallVolume.toStringAsFixed(0)}) -> مصلحة المنصة: PUT ⬇"
                                   : (service.crowdPutVolume > service.crowdCallVolume
-                                      ? "💡 الجمهور متكدس في PUT (\$${service.crowdPutVolume.toStringAsFixed(0)}) -> المنصة ستربّح الأقل: صفقة CALL ⬆"
-                                      : "⏳ جاري رصد تجمّع صفقات المتداولين في الشمعة الحالية..."),
+                                      ? "💡 في هذه الدقيقة دخل الناس PUT أكثر (\$${service.crowdPutVolume.toStringAsFixed(0)}) -> مصلحة المنصة: CALL ⬆"
+                                      : "⏳ بداية دقيقة جديدة (00s) — جاري حساب السيولة التي تدخل في هذه الدقيقة فقط..."),
                               style: const TextStyle(fontSize: 11.5, color: Colors.cyanAccent, fontWeight: FontWeight.bold),
                             ),
                           ),
@@ -2343,7 +2279,7 @@ jobs:
                                   controller: _diffController,
                                   keyboardType: TextInputType.number,
                                   decoration: InputDecoration(
-                                    labelText: "حدد الفارق المطلوب بين CALL و PUT (\$)",
+                                    labelText: "حدد الفارق المطلوب في الدقيقة (\$)",
                                     filled: true,
                                     fillColor: const Color(0xFF0B0F19),
                                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
@@ -2354,23 +2290,23 @@ jobs:
                               ),
                               const SizedBox(width: 8),
                               Expanded(
-                                flex: 2,
-                                child: DropdownButtonFormField<int>(
-                                  value: _selectedCrowdWindow,
+                                flex: 3,
+                                child: DropdownButtonFormField<bool>(
+                                  value: _enterAtMinuteEndOnly,
+                                  isExpanded: true,
                                   decoration: InputDecoration(
-                                    labelText: "مدة المراقبة",
+                                    labelText: "توقيت دخول الصفقة",
                                     filled: true,
                                     fillColor: const Color(0xFF0B0F19),
                                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                                     contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
                                   ),
                                   items: const [
-                                    DropdownMenuItem(value: 30, child: Text("30 ثانية")),
-                                    DropdownMenuItem(value: 60, child: Text("1 دقيقة")),
-                                    DropdownMenuItem(value: 120, child: Text("2 دقيقتان")),
+                                    DropdownMenuItem(value: true, child: Text("نهاية الدقيقة (بعد رصد 60s)")),
+                                    DropdownMenuItem(value: false, child: Text("فوراً عند بلوغ الفارق")),
                                   ],
                                   onChanged: (val) {
-                                    setState(() => _selectedCrowdWindow = val!);
+                                    setState(() => _enterAtMinuteEndOnly = val!);
                                     _syncSettings(service);
                                   },
                                 ),
@@ -2546,11 +2482,11 @@ jobs:
                             items: const [
                               DropdownMenuItem(
                                 value: "platform_interest_contrarian",
-                                child: Text("مصلحة المنصة: عكس سيولة الجمهور (الأقل دخولاً يربح 💰)"),
+                                child: Text("مصلحة المنصة: عكس سيولة الدقيقة (الأقل دخولاً يربح 💰)"),
                               ),
                               DropdownMenuItem(
                                 value: "hybrid_ai_contrarian",
-                                child: Text("مدمج: مصلحة المنصة + الذكاء الاصطناعي العميق معاً 🔥"),
+                                child: Text("مدمج: رادار الدقيقة + الذكاء الاصطناعي العميق معاً 🔥"),
                               ),
                               DropdownMenuItem(
                                 value: "local_deep_ai",
@@ -2705,8 +2641,8 @@ jobs:
                               ),
                               label: Text(
                                 service.isAutoTrading
-                                    ? "إيقاف البوت (يراقب فارق السيولة \$${_diffController.text}+)"
-                                    : "تشغيل التداول الآلي مع مصلحة المنصة (فارق \$${_diffController.text}+)",
+                                    ? "إيقاف البوت (يرصد الدقيقة الحالية: فارق \$${_diffController.text}+)"
+                                    : "تشغيل رادار الدقيقة الواحدة (فارق \$${_diffController.text}+)",
                                 style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
                               ),
                             ),
