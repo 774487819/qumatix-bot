@@ -38,9 +38,9 @@ jobs:
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Pro AI v3.2 Real Strategy & Balance Sync"
+          description: "QuMatix Pro AI v4.0 Real Execution Engine"
           publish_to: 'none'
-          version: 3.2.0+5
+          version: 4.0.0+6
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -100,21 +100,18 @@ jobs:
           </manifest>
           EOF
 
-      - name: Generate quotex_service.dart (Accurate Win/Loss Evaluator + Smart Strategy + Live Balance)
+      - name: Generate quotex_service.dart (Real DOM Execution + Exact Asset Price Filter + Verified Balance Win/Loss)
         run: |
           mkdir -p lib/services
           cat << 'EOF' > lib/services/quotex_service.dart
           import 'dart:async';
           import 'dart:convert';
-          import 'dart:io';
           import 'dart:math';
           import 'package:flutter/foundation.dart';
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
           class QuotexService extends ChangeNotifier {
-            WebSocket? _socket;
             InAppWebViewController? _webViewController;
-            Timer? _pingTimer;
             Timer? _webSyncTimer;
             Timer? _tradeLifecycleTimer;
 
@@ -128,10 +125,9 @@ jobs:
             String _balanceText = "\$0.00";
             String _accountType = "demo";
             String _currentDomain = "quotex.io";
-            String _cookieHeader = "";
 
             String _selectedAssetMode = "AUTO_CHART";
-            String _chartDetectedAsset = "EURUSD_otc";
+            String _chartDisplayPair = "USD/BRL (OTC)";
             int _tradeDuration = 60;
             double _baseAmount = 1.0;
             double _currentTradeAmount = 1.0;
@@ -146,16 +142,17 @@ jobs:
             double _emaSlow = 0.0;
             double _currentRsi = 50.0;
             double _priceMomentum = 0.0;
-            String _lastSignal = "بانتظار قراءات السوق الحية...";
+            double _bollingerUpper = 0.0;
+            double _bollingerLower = 0.0;
+            String _lastSignal = "بانتظار قراءات الزوج من الشارت...";
             int _totalTrades = 0;
             int _wonTrades = 0;
             int _lostTrades = 0;
 
-            // بيانات الصفقة الجارية لتقييم الربح والخسارة بدقة 100%
             double _activeTradeEntryPrice = 0.0;
             double _activeTradeBalanceBefore = 0.0;
             String _activeTradeDirection = "call";
-            String _activeTradeAsset = "EURUSD_otc";
+            String _activeTradeAsset = "";
             double _activeTradeAmount = 1.0;
             int _remainingSeconds = 0;
 
@@ -173,7 +170,7 @@ jobs:
             String get accountType => _accountType;
             String get currentDomain => _currentDomain;
             String get selectedAssetMode => _selectedAssetMode;
-            String get activeAsset => _selectedAssetMode == "AUTO_CHART" ? _chartDetectedAsset : _selectedAssetMode;
+            String get activeAsset => _selectedAssetMode == "AUTO_CHART" ? _chartDisplayPair : _selectedAssetMode;
             int get tradeDuration => _tradeDuration;
             double get baseAmount => _baseAmount;
             double get currentTradeAmount => _currentTradeAmount;
@@ -192,8 +189,15 @@ jobs:
             int get totalTrades => _totalTrades;
             int get wonTrades => _wonTrades;
             int get lostTrades => _lostTrades;
-            int get winRate => (_wonTrades + _lostTrades) > 0 ? ((_wonTrades * 100) ~/ (_wonTrades + _lostTrades)) : 0;
             List<String> get logs => List.unmodifiable(_logs);
+
+            static String normalizeAssetKey(String raw) {
+              return raw
+                  .replaceAll('(OTC)', 'OTC')
+                  .replaceAll('_otc', 'OTC')
+                  .replaceAll(RegExp(r'[^A-Za-z0-9]'), '')
+                  .toUpperCase();
+            }
 
             void attachWebViewController(InAppWebViewController controller) {
               _webViewController = controller;
@@ -215,13 +219,8 @@ jobs:
               }
               if (asset != null && asset != _selectedAssetMode) {
                 _selectedAssetMode = asset;
-                if (asset != "AUTO_CHART") {
-                  _priceHistory.clear();
-                  _lastPrice = 0.0;
-                  if (_isConnected) {
-                    _subscribeToAsset(asset);
-                  }
-                }
+                _priceHistory.clear();
+                _lastPrice = 0.0;
               }
               if (duration != null) _tradeDuration = duration;
               if (baseAmount != null && baseAmount > 0) {
@@ -234,10 +233,35 @@ jobs:
               if (martingaleMultiplier != null && martingaleMultiplier > 1.0) {
                 _martingaleMultiplier = martingaleMultiplier;
               }
-              if (takeProfit != null) _takeProfitTarget = takeProfit;
-              if (stopLoss != null) _stopLossLimit = stopLoss;
-              if (strategy != null) _strategy = strategy;
+              if (takeProfit != null && takeProfit > 0) _takeProfitTarget = takeProfit;
+              if (stopLoss != null && stopLoss > 0) _stopLossLimit = stopLoss;
+              if (strategy != null && strategy != _strategy) {
+                _strategy = strategy;
+                _refreshSignalBadge();
+              }
               notifyListeners();
+            }
+
+            void _refreshSignalBadge() {
+              if (_priceHistory.length < 4) {
+                if (_strategy == "qumatix_rsi_ema") {
+                  _lastSignal = "QuMatix | تجميع قراءات (${_priceHistory.length}/5)";
+                } else if (_strategy == "trend_momentum") {
+                  _lastSignal = "Trend Pro | تجميع قراءات (${_priceHistory.length}/5)";
+                } else {
+                  _lastSignal = "Sniper | تجميع قراءات (${_priceHistory.length}/5)";
+                }
+                return;
+              }
+              if (_strategy == "qumatix_rsi_ema") {
+                _lastSignal = "QuMatix | RSI: ${_currentRsi.toStringAsFixed(1)} | ${_emaFast >= _emaSlow ? 'EMA صاعد' : 'EMA هابط'}";
+              } else if (_strategy == "trend_momentum") {
+                final dir = (_emaFast >= _emaSlow && _priceMomentum >= 0) ? "زخم صاعد ↗" : "زخم هابط ↘";
+                _lastSignal = "Trend Pro | $dir";
+              } else {
+                final pos = _lastPrice <= _bollingerLower ? "قاع ارتدادي ⬆" : (_lastPrice >= _bollingerUpper ? "قمة ارتدادية ⬇" : "داخل القناة");
+                _lastSignal = "Sniper | $pos";
+              }
             }
 
             void addLog(String message) {
@@ -257,7 +281,6 @@ jobs:
             }) async {
               _accountType = isRealAccount ? "real" : "demo";
               _currentDomain = domain;
-              _cookieHeader = cookieHeader;
 
               if (detectedBalance != null && detectedBalance.isNotEmpty) {
                 _parseAndSetBalance(detectedBalance);
@@ -265,17 +288,15 @@ jobs:
 
               _isConnected = true;
               _isAuthenticated = true;
-              addLog("تم ربط الحساب بنجاح عبر السيرفر ($domain) ✔");
+              addLog("تم ربط الحساب والشارت الحي بنجاح عبر ($domain) ✔");
               notifyListeners();
 
-              _subscribeToAsset(activeAsset);
               _startWebSyncTimer();
             }
 
             void _parseAndSetBalance(String rawStr) {
               final clean = rawStr.trim();
               if (clean.isEmpty) return;
-              // استخراج الرقم العشري مثل 142.97 من النص الظاهر مثل "$142.97"
               final match = RegExp(r'([0-9]+(?:[.,][0-9]{1,2})?)').firstMatch(clean.replaceAll(',', ''));
               if (match != null) {
                 final val = double.tryParse(match.group(1)!);
@@ -284,6 +305,7 @@ jobs:
                   _balanceText = "\$${val.toStringAsFixed(2)}";
                   if (_initialSessionBalance == 0.0 && val > 0) {
                     _initialSessionBalance = val;
+                    addLog("تم تثبيت رصيد بداية الجلسة عند: \$${val.toStringAsFixed(2)}");
                   }
                 }
               }
@@ -291,65 +313,62 @@ jobs:
 
             void _startWebSyncTimer() {
               _webSyncTimer?.cancel();
-              _webSyncTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) async {
+              _webSyncTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) async {
                 if (!_isConnected || _webViewController == null) return;
                 try {
-                  final targetAsset = activeAsset;
+                  final wantedNormKey = normalizeAssetKey(activeAsset);
                   final res = await _webViewController!.evaluateJavascript(source: '''
                     (function() {
                       try {
-                        // 1. استخراج الرصيد الحقيقي الظاهر أعلى المنصة
+                        // 1. قراءة الرصيد الظاهر أعلى المنصة
                         let foundBalance = '';
-                        if (window.__qm_ws_balance !== null && window.__qm_ws_balance !== undefined) {
-                          foundBalance = String(window.__qm_ws_balance);
-                        }
-                        if (!foundBalance) {
-                          const allEls = document.querySelectorAll('header *, [class*="usermenu"] *, [class*="balance"] *, [class*=" header"] *');
-                          for (let i = 0; i < allEls.length; i++) {
-                            const el = allEls[i];
-                            if (el.children.length === 0 && el.innerText) {
-                              const t = el.innerText.trim();
-                              if (/[\x24€£৳₹¥]\s*[0-9,]+(\.[0-9]{1,2})?/.test(t) || /[0-9,]+\.[0-9]{2}\s*[\x24€£৳₹¥]/.test(t)) {
-                                foundBalance = t;
+                        const topNodes = document.querySelectorAll('header *, [class*="usermenu"] *, div, span, b');
+                        for (let i = 0; i < topNodes.length; i++) {
+                          const el = topNodes[i];
+                          if (el.children.length === 0 && el.innerText) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.top >= 0 && rect.top < 130 && rect.width > 10) {
+                              const m = el.innerText.trim().match(/^[\\x24€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?\\$/);
+                              if (m && m[0]) {
+                                foundBalance = m[0];
                                 break;
                               }
                             }
                           }
                         }
-                        if (!foundBalance) {
-                          // بحث عام في الجزء العلوي من الشاشة (أول 130 بكسل)
-                          const topNodes = document.querySelectorAll('div, span, b, p');
-                          for (let i = 0; i < topNodes.length; i++) {
-                            const el = topNodes[i];
-                            if (el.children.length <= 1 && el.innerText) {
-                              const rect = el.getBoundingClientRect();
-                              if (rect.top >= 0 && rect.top < 140 && rect.width > 10) {
-                                const m = el.innerText.match(/[\x24€£৳₹¥]\s*[0-9,]+(\.[0-9]{1,2})?/);
-                                if (m && m[0]) {
-                                  foundBalance = m[0];
-                                  break;
-                                }
-                              }
+
+                        // 2. قراءة اسم الزوج المفتوح فعلياً في الشارت (مثل USD/BRL (OTC))
+                        let chartPair = '';
+                        const dealNodes = document.querySelectorAll('[class*="pair"], [class*="asset"], [class*="section-deal"] *, span, div');
+                        for (let i = 0; i < dealNodes.length; i++) {
+                          const el = dealNodes[i];
+                          if (el.children.length === 0 && el.innerText) {
+                            const txt = el.innerText.trim();
+                            if (/^[A-Z]{3}\\/[A-Z]{3}(\\s*\\(OTC\\))?\\$/.test(txt) || /^[A-Za-z0-9]+\\s*\\(OTC\\\)\\$/.test(txt)) {
+                              chartPair = txt;
+                              break;
                             }
                           }
                         }
 
-                        // 2. معرفة الزوج المفتوح حالياً في الشارت وأسعاره
-                        const latestAsset = window.__qm_latest_asset || '';
-                        const askAsset = '$targetAsset';
+                        // 3. جلب أسعار هذا الزوج تحديداً دون خلطها بأزواج أخرى
+                        function norm(s) {
+                          return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+                        }
+                        const activeKey = ('$wantedNormKey' !== '' && '$_selectedAssetMode' !== 'AUTO_CHART')
+                            ? '$wantedNormKey'
+                            : (chartPair ? norm(chartPair) : (window.__qm_active_ws_key || ''));
+
                         let prices = [];
-                        if ('$_selectedAssetMode' === 'AUTO_CHART' && latestAsset && window.__qm_asset_prices && window.__qm_asset_prices[latestAsset]) {
-                          prices = window.__qm_asset_prices[latestAsset];
-                        } else if (window.__qm_asset_prices && window.__qm_asset_prices[askAsset] && window.__qm_asset_prices[askAsset].length > 0) {
-                          prices = window.__qm_asset_prices[askAsset];
-                        } else if (window.__qm_prices && window.__qm_prices.length > 0) {
-                          prices = window.__qm_prices;
+                        if (activeKey && window.__qm_by_norm && window.__qm_by_norm[activeKey]) {
+                          prices = window.__qm_by_norm[activeKey];
                         }
 
                         return JSON.stringify({
                           balance: foundBalance,
-                          prices: prices.slice(-60),
-                          latestAsset: latestAsset
+                          chartPair: chartPair,
+                          activeKey: activeKey,
+                          prices: prices.slice(-60)
                         });
                       } catch(e) { return '{}'; }
                     })();
@@ -364,29 +383,36 @@ jobs:
                         _parseAndSetBalance(bStr);
                       }
 
-                      final detAsset = map['latestAsset']?.toString() ?? '';
-                      if (detAsset.isNotEmpty && detAsset != _chartDetectedAsset) {
-                        _chartDetectedAsset = detAsset;
+                      final cPair = map['chartPair']?.toString() ?? '';
+                      if (cPair.isNotEmpty && cPair != _chartDisplayPair) {
+                        if (_selectedAssetMode == "AUTO_CHART") {
+                          _priceHistory.clear();
+                          _lastPrice = 0.0;
+                        }
+                        _chartDisplayPair = cPair;
                       }
 
                       final rawPrices = map['prices'];
                       if (rawPrices is List && rawPrices.isNotEmpty) {
-                        bool updated = false;
+                        _priceHistory.clear();
                         for (final item in rawPrices) {
                           if (item is num && item > 0) {
-                            final d = item.toDouble();
-                            if (_priceHistory.isEmpty || _priceHistory.last != d) {
-                              _priceHistory.add(d);
-                              _lastPrice = d;
-                              updated = true;
-                            }
+                            _priceHistory.add(item.toDouble());
                           }
                         }
-                        while (_priceHistory.length > 80) {
-                          _priceHistory.removeAt(0);
-                        }
-                        if (updated) {
+                        if (_priceHistory.isNotEmpty) {
+                          _lastPrice = _priceHistory.last;
                           _calculateIndicators();
+                          _refreshSignalBadge();
+                        }
+                      }
+
+                      // فحص فوري لهدف الربح ووقف الخسارة أثناء عمل البوت
+                      if (_isAutoTrading && _initialSessionBalance > 0) {
+                        if (netProfit >= _takeProfitTarget) {
+                          stopAutoTrading(reason: "🎯 تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
+                        } else if (netProfit <= -_stopLossLimit) {
+                          stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
                         }
                       }
                       notifyListeners();
@@ -394,27 +420,6 @@ jobs:
                   }
                 } catch (_) {}
               });
-            }
-
-            Future<void> _subscribeToAsset(String asset) async {
-              if (_webViewController != null) {
-                try {
-                  await _webViewController!.evaluateJavascript(source: '''
-                    (function() {
-                      try {
-                        if (window.__qm_sockets && window.__qm_sockets.length > 0) {
-                          for (let ws of window.__qm_sockets) {
-                            if (ws && ws.readyState === 1) {
-                              ws.send('42["instruments/update",{"asset":"$asset","period":$_tradeDuration}]');
-                              ws.send('42["depth/follow","$asset"]');
-                            }
-                          }
-                        }
-                      } catch(e) {}
-                    })();
-                  ''');
-                } catch (_) {}
-              }
             }
 
             double _computeEma(List<double> data, int period) {
@@ -433,10 +438,21 @@ jobs:
             void _calculateIndicators() {
               if (_priceHistory.length < 4) return;
 
-              _emaFast = _computeEma(_priceHistory, 6);
-              _emaSlow = _computeEma(_priceHistory, 18);
-              _priceMomentum = _priceHistory.last - _priceHistory[max(0, _priceHistory.length - 5)];
+              _emaFast = _computeEma(_priceHistory, 5);
+              _emaSlow = _computeEma(_priceHistory, 14);
+              _priceMomentum = _priceHistory.last - _priceHistory[max(0, _priceHistory.length - 4)];
 
+              // حساب قنوات بولينجر (Bollinger Bands)
+              final double mean = _priceHistory.reduce((a, b) => a + b) / _priceHistory.length;
+              double sumSq = 0.0;
+              for (final p in _priceHistory) {
+                sumSq += (p - mean) * (p - mean);
+              }
+              final double stdDev = sqrt(sumSq / _priceHistory.length);
+              _bollingerUpper = mean + (1.6 * stdDev);
+              _bollingerLower = mean - (1.6 * stdDev);
+
+              // حساب مؤشر RSI الحقيقي
               final int window = min(14, _priceHistory.length - 1);
               double gains = 0.0;
               double losses = 0.0;
@@ -444,7 +460,7 @@ jobs:
                 final diff = _priceHistory[i] - _priceHistory[i - 1];
                 if (diff > 0) {
                   gains += diff;
-                } else {
+                } else if (diff < 0) {
                   losses -= diff;
                 }
               }
@@ -453,7 +469,7 @@ jobs:
               if (avgLoss == 0 && avgGain == 0) {
                 _currentRsi = 50.0;
               } else if (avgLoss == 0) {
-                _currentRsi = 82.0;
+                _currentRsi = 85.0;
               } else {
                 final rs = avgGain / avgLoss;
                 _currentRsi = 100.0 - (100.0 / (1.0 + rs));
@@ -473,10 +489,20 @@ jobs:
                 addLog("تنبيه: يرجى ربط الحساب من تبويب المنصة أولاً قبل تشغيل البوت.");
                 return;
               }
+              if (_initialSessionBalance > 0) {
+                if (netProfit >= _takeProfitTarget) {
+                  addLog("🎯 لقد وصلت بالفعل إلى هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}).");
+                  return;
+                }
+                if (netProfit <= -_stopLossLimit) {
+                  addLog("🛑 لقد وصلت إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)}).");
+                  return;
+                }
+              }
               _isAutoTrading = true;
               _currentTradeAmount = _baseAmount;
-              _subscribeToAsset(activeAsset);
-              addLog("تم تفعيل البوت الآلي الذكي على الزوج $activeAsset 🤖");
+              addLog("تم تفعيل البوت الآلي على الزوج ($activeAsset) باستراتيجية ($_strategy) 🤖");
+              _refreshSignalBadge();
               notifyListeners();
 
               if (!_isTradeOpen) {
@@ -493,11 +519,20 @@ jobs:
             Future<void> _executeStrategyCycle() async {
               if (!_isAutoTrading || !_isConnected || _isTradeOpen) return;
 
-              await _subscribeToAsset(activeAsset);
+              if (_initialSessionBalance > 0) {
+                if (netProfit >= _takeProfitTarget) {
+                  stopAutoTrading(reason: "🎯 تم تحقيق هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)})!");
+                  return;
+                }
+                if (netProfit <= -_stopLossLimit) {
+                  stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)})!");
+                  return;
+                }
+              }
 
-              if (_priceHistory.length < 6) {
-                _lastSignal = "تجميع قراءات السعر (${_priceHistory.length}/6)...";
-                addLog("⏳ جاري تجميع قراءات السعر الحية (${_priceHistory.length}/6) قبل إصدار الإشارة...");
+              if (_priceHistory.length < 5) {
+                _refreshSignalBadge();
+                addLog("⏳ بانتظار وصول 5 قراءات حية للزوج ($activeAsset) من الشارت (حالياً: ${_priceHistory.length}/5)...");
                 notifyListeners();
                 Future.delayed(const Duration(seconds: 3), () {
                   if (_isAutoTrading && !_isTradeOpen) _executeStrategyCycle();
@@ -509,56 +544,53 @@ jobs:
 
               final double price = _lastPrice;
               final double lastStep = _priceHistory.last - _priceHistory[_priceHistory.length - 2];
-              final double prevStep = _priceHistory[_priceHistory.length - 2] - _priceHistory[_priceHistory.length - 3];
 
               String direction = "call";
               String reason = "";
 
               if (_strategy == "qumatix_rsi_ema") {
-                // قواعد استراتيجية QuMatix المصححة:
-                // 1) عدم الشراء أبداً في التشبع الشرائي (RSI >= 60) بل البيع مع الارتداد الهابط!
-                // 2) عدم البيع أبداً في التشبع البيعي (RSI <= 40) بل الشراء مع الارتداد الصاعد!
-                if (_currentRsi >= 60.0) {
+                if (_currentRsi >= 62.0) {
                   direction = "put";
-                  reason = "تشبع شرائي عند القمة (RSI: ${_currentRsi.toStringAsFixed(1)}) -> بيع ارتدادي PUT";
-                } else if (_currentRsi <= 40.0) {
+                  reason = "[QuMatix RSI+EMA] تشبع شرائي عند القمة (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price) -> بيع PUT";
+                } else if (_currentRsi <= 38.0) {
                   direction = "call";
-                  reason = "تشبع بيعي عند القاع (RSI: ${_currentRsi.toStringAsFixed(1)}) -> شراء ارتدادي CALL";
-                } else if (_emaFast > _emaSlow && _priceMomentum > 0 && lastStep >= 0) {
+                  reason = "[QuMatix RSI+EMA] تشبع بيعي عند القاع (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price) -> شراء CALL";
+                } else if (_emaFast > _emaSlow && _priceMomentum >= 0) {
                   direction = "call";
-                  reason = "مسار صاعد مؤكد EMA6>EMA18 (RSI: ${_currentRsi.toStringAsFixed(1)}) -> شراء CALL";
-                } else if (_emaFast < _emaSlow && _priceMomentum < 0 && lastStep <= 0) {
-                  direction = "put";
-                  reason = "مسار هابط مؤكد EMA6<EMA18 (RSI: ${_currentRsi.toStringAsFixed(1)}) -> بيع PUT";
-                } else if (lastStep > 0 && prevStep > 0) {
-                  direction = "call";
-                  reason = "شموع صاعدة متتالية عند $price (RSI: ${_currentRsi.toStringAsFixed(1)}) -> CALL";
+                  reason = "[QuMatix RSI+EMA] تقاطع صاعد EMA5>EMA14 (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price) -> شراء CALL";
                 } else {
                   direction = "put";
-                  reason = "ضغط بيعي هابط عند $price (RSI: ${_currentRsi.toStringAsFixed(1)}) -> PUT";
+                  reason = "[QuMatix RSI+EMA] تقاطع هابط EMA5<EMA14 (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price) -> بيع PUT";
                 }
+                _lastSignal = "QuMatix: ${direction.toUpperCase()} | RSI: ${_currentRsi.toStringAsFixed(1)}";
               } else if (_strategy == "trend_momentum") {
-                if (_emaFast >= _emaSlow && _currentRsi < 68) {
+                if (_emaFast >= _emaSlow && lastStep >= 0) {
                   direction = "call";
-                  reason = "زخم صاعد مستمر (RSI: ${_currentRsi.toStringAsFixed(1)}) -> CALL";
-                } else {
+                  reason = "[Trend Pro] اتجاه وزخم صاعد مستمر (السعر: $price | الزخم: +${_priceMomentum.toStringAsFixed(5)}) -> شراء CALL";
+                } else if (_emaFast < _emaSlow && lastStep <= 0) {
                   direction = "put";
-                  reason = "زخم هابط مستمر (RSI: ${_currentRsi.toStringAsFixed(1)}) -> PUT";
+                  reason = "[Trend Pro] اتجاه وزخم هابط مستمر (السعر: $price | الزخم: ${_priceMomentum.toStringAsFixed(5)}) -> بيع PUT";
+                } else {
+                  direction = _priceMomentum >= 0 ? "call" : "put";
+                  reason = "[Trend Pro] زخم سعري ${direction == 'call' ? 'صاعد' : 'هابط'} عند $price -> ${direction.toUpperCase()}";
                 }
+                _lastSignal = "Trend Pro: ${direction.toUpperCase()} (${_priceMomentum >= 0 ? 'صاعد ↗' : 'هابط ↘'})";
               } else {
-                // قناص الارتداد (Bollinger + RSI)
-                final double mean = _priceHistory.reduce((a, b) => a + b) / _priceHistory.length;
-                if (price >= mean || _currentRsi >= 52) {
-                  direction = "put";
-                  reason = "ارتداد هابط من فوق المتوسط (RSI: ${_currentRsi.toStringAsFixed(1)}) -> PUT";
-                } else {
+                // قناص الارتداد السعري (Bollinger Bands + RSI)
+                if (price <= _bollingerLower || _currentRsi <= 42.0) {
                   direction = "call";
-                  reason = "ارتداد صاعد من تحت المتوسط (RSI: ${_currentRsi.toStringAsFixed(1)}) -> CALL";
+                  reason = "[Sniper Reversal] ارتداد صاعد من قاع بولينجر $_bollingerLower (السعر: $price) -> شراء CALL";
+                } else if (price >= _bollingerUpper || _currentRsi >= 58.0) {
+                  direction = "put";
+                  reason = "[Sniper Reversal] ارتداد هابط من قمة بولينجر $_bollingerUpper (السعر: $price) -> بيع PUT";
+                } else {
+                  direction = lastStep < 0 ? "call" : "put";
+                  reason = "[Sniper Reversal] ارتداد سعري عكسي عند $price -> ${direction.toUpperCase()}";
                 }
+                _lastSignal = "Sniper: ${direction.toUpperCase()} @ $price";
               }
 
-              _lastSignal = "${direction.toUpperCase()} | RSI: ${_currentRsi.toStringAsFixed(1)}";
-              addLog("📊 إشارة الاستراتيجية: $reason");
+              addLog("📊 $reason");
               await placeOrder(
                 asset: activeAsset,
                 direction: direction,
@@ -573,7 +605,7 @@ jobs:
               required double amount,
               required int duration,
             }) async {
-              if (!_isConnected) {
+              if (!_isConnected || _webViewController == null) {
                 addLog("تنبيه: اربط حسابك أولاً من شاشة المنصة لتنفيذ الصفقات.");
                 return;
               }
@@ -582,63 +614,109 @@ jobs:
                 return;
               }
 
-              final targetAsset = asset == "AUTO_CHART" ? _chartDetectedAsset : asset;
+              final double balanceBeforeClick = _balance;
+              final double entryPriceBeforeClick = _lastPrice;
+              final bool isCall = direction.toLowerCase() == "call";
+              final String cleanAmount = amount == amount.roundToDouble()
+                  ? amount.toInt().toString()
+                  : amount.toStringAsFixed(2);
 
+              // ضبط مبلغ الاستثمار في واجهة المنصة ثم النقر الحقيقي على زر شراء/بيع في الشارت لمنع رسالة (خطأ في فتح الصفقة)
+              final clickResult = await _webViewController!.evaluateJavascript(source: '''
+                (function() {
+                  try {
+                    // 1. ضبط مبلغ الصفقة داخل حقل الاستثمار في المنصة
+                    const inputs = document.querySelectorAll('input');
+                    for (let i = 0; i < inputs.length; i++) {
+                      const inp = inputs[i];
+                      const val = inp.value || '';
+                      if (val.includes('\\x24') || val.includes('€') || val.includes('£') || val.includes('৳') || /^[0-9.,\\\s]+\\$/.test(val.trim())) {
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        if (nativeSetter) {
+                          nativeSetter.call(inp, '$cleanAmount');
+                          inp.dispatchEvent(new Event('input', { bubbles: true }));
+                          inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        break;
+                      }
+                    }
+
+                    // 2. البحث عن زر الشراء الأخضر وزر البيع الأحمر الحقيقيين في المنصة
+                    let targetBtn = null;
+                    const buttons = document.querySelectorAll('button, [role="button"], .btn, [class*="button"]');
+                    for (let i = 0; i < buttons.length; i++) {
+                      const b = buttons[i];
+                      const cls = (b.className || '').toLowerCase();
+                      const txt = (b.innerText || '').trim();
+                      if (${isCall ? 'true' : 'false'}) {
+                        if (cls.includes('call') || cls.includes('green') || cls.includes('up') || txt.includes('شراء') || txt.includes('أعلى') || txt.includes('UP') || txt.includes('CALL')) {
+                          targetBtn = b;
+                          break;
+                        }
+                      } else {
+                        if (cls.includes('put') || cls.includes('red') || cls.includes('down') || txt.includes('بيع') || txt.includes('أدنى') || txt.includes('DOWN') || txt.includes('PUT')) {
+                          targetBtn = b;
+                          break;
+                        }
+                      }
+                    }
+
+                    if (targetBtn) {
+                      targetBtn.click();
+                      return 'CLICKED_OK';
+                    }
+                    return 'BTN_NOT_FOUND';
+                  } catch(e) {
+                    return 'ERR:' + e.message;
+                  }
+                })();
+              ''');
+
+              if (clickResult == null || !clickResult.toString().contains("CLICKED_OK")) {
+                addLog("⚠ تعذر العثور على أزرار التداول في الشارت. تأكد من بقاء شاشة الشارت مفتوحة في تبويب المنصة.");
+                return;
+              }
+
+              // انتظار 1.8 ثانية للتحقق من أن المنصة خصمت مبلغ الصفقة فعلياً وفتحت الصفقة دون خطأ
+              await Future.delayed(const Duration(milliseconds: 1800));
+
+              // التحقق من عدم ظهور لافتة (خطأ في فتح الصفقة) ومن تغير الرصيد
+              final verifyRes = await _webViewController!.evaluateJavascript(source: '''
+                (function() {
+                  try {
+                    const bodyTxt = document.body ? document.body.innerText : '';
+                    const hasErr = bodyTxt.includes('خطأ في فتح الصفقة') || bodyTxt.includes('Error opening');
+                    return hasErr ? 'ERROR_BANNER' : 'OK';
+                  } catch(e) { return 'OK'; }
+                })();
+              ''');
+
+              final bool hasErrorBanner = verifyRes != null && verifyRes.toString().contains("ERROR_BANNER");
+              final bool balanceDeducted = balanceBeforeClick > 0 && (_balance < balanceBeforeClick - 0.01);
+
+              if (hasErrorBanner && !balanceDeducted) {
+                addLog("⚠ رفضت المنصة فتح الصفقة على هذا الزوج حالياً — لن يتم احتسابها في الإحصائيات.");
+                if (_isAutoTrading) {
+                  Future.delayed(const Duration(seconds: 5), () {
+                    if (_isAutoTrading && !_isTradeOpen) _executeStrategyCycle();
+                  });
+                }
+                return;
+              }
+
+              // تم التأكد من فتح الصفقة فعلياً!
               _isTradeOpen = true;
               _remainingSeconds = duration;
-              _activeTradeEntryPrice = _lastPrice;
-              _activeTradeBalanceBefore = _balance;
+              _activeTradeEntryPrice = entryPriceBeforeClick;
+              _activeTradeBalanceBefore = balanceBeforeClick;
               _activeTradeDirection = direction.toLowerCase();
-              _activeTradeAsset = targetAsset;
+              _activeTradeAsset = _chartDisplayPair;
               _activeTradeAmount = amount;
               _totalTrades++;
               notifyListeners();
 
-              final orderData = jsonEncode({
-                "asset": targetAsset,
-                "amount": amount,
-                "action": direction.toLowerCase(),
-                "time": duration,
-                "isDemo": _accountType == "demo" ? 1 : 0,
-                "tournamentId": 0,
-                "requestId": DateTime.now().millisecondsSinceEpoch,
-                "optionType": 100,
-              });
+              addLog("🚀 تم تأكيد فتح صفقة ${direction.toUpperCase()} على $_chartDisplayPair بمبلغ \$$cleanAmount عند السعر $_activeTradeEntryPrice");
 
-              final orderPacket = '42["orders/open",$orderData]';
-
-              // إرسال أمر واحد فقط عبر WebSocket المفتوح في المنصة لمنع تكرار الصفقة مرتين
-              if (_webViewController != null) {
-                try {
-                  final isCall = direction.toLowerCase() == "call";
-                  await _webViewController!.evaluateJavascript(source: '''
-                    (function() {
-                      try {
-                        let sentViaWs = false;
-                        if (window.__qm_sockets && window.__qm_sockets.length > 0) {
-                          for (let ws of window.__qm_sockets) {
-                            if (ws && ws.readyState === 1) {
-                              ws.send('$orderPacket');
-                              sentViaWs = true;
-                              break;
-                            }
-                          }
-                        }
-                        if (!sentViaWs) {
-                          const upBtn = document.querySelector('.call-btn, [class*="btn-call"], [class*="button--call"], .section-deal__put-call .btn-green');
-                          const downBtn = document.querySelector('.put-btn, [class*="btn-put"], [class*="button--put"], .section-deal__put-call .btn-red');
-                          if (${isCall ? 'true' : 'false'} && upBtn) upBtn.click();
-                          else if (!${isCall ? 'true' : 'false'} && downBtn) downBtn.click();
-                        }
-                      } catch(e) {}
-                    })();
-                  ''');
-                } catch (_) {}
-              }
-
-              addLog("🚀 فتح صفقة ${direction.toUpperCase()} على $targetAsset بمبلغ \$$amount عند السعر $_activeTradeEntryPrice (المدة: ${duration}s)");
-
-              // مؤقت عد تنازلي لمتابعة إغلاق الصفقة وتقييم الربح أو الخسارة بدقة
               _tradeLifecycleTimer?.cancel();
               _tradeLifecycleTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
                 if (_remainingSeconds > 0) {
@@ -652,40 +730,32 @@ jobs:
             }
 
             Future<void> _finalizeAndEvaluateTrade() async {
-              // انتظار ثانيتين لتحديث الرصيد النهائي من السيرفر بعد إغلاق الشمعة
               await Future.delayed(const Duration(seconds: 2));
 
-              final double exitPrice = _lastPrice;
               final double currentBal = _balance;
-              bool isWin = false;
+              final double beforeBal = _activeTradeBalanceBefore;
+              final double diff = currentBal - beforeBal;
 
-              // التقييم الأول: مقارنة الرصيد الفعلي قبل وبعد الصفقة إذا كان الرصيد مقروءاً
-              if (_activeTradeBalanceBefore > 0 && currentBal > 0 && (currentBal - _activeTradeBalanceBefore).abs() > 0.01) {
-                isWin = currentBal > _activeTradeBalanceBefore;
-              } else {
-                // التقييم الثاني: مقارنة سعر الدخول بسعر الإغلاق الفعلي من السيرفر
-                if (_activeTradeDirection == "call") {
-                  isWin = exitPrice > _activeTradeEntryPrice;
-                } else {
-                  isWin = exitPrice < _activeTradeEntryPrice;
-                }
-              }
-
-              if (isWin) {
-                _wonTrades++;
-                final double estProfit = (_activeTradeBalanceBefore > 0 && currentBal > _activeTradeBalanceBefore)
-                    ? (currentBal - _activeTradeBalanceBefore)
-                    : (_activeTradeAmount * 0.88);
-                _currentTradeAmount = _baseAmount;
-                addLog("✔ صفقة رابحة (+ \$${estProfit.toStringAsFixed(2)}) | سعر الدخول: $_activeTradeEntryPrice -> الإغلاق: $exitPrice | العودة للمبلغ الأساسي: \$$_baseAmount");
-              } else {
-                _lostTrades++;
-                if (_useMartingale) {
-                  _currentTradeAmount = double.parse((_currentTradeAmount * _martingaleMultiplier).toStringAsFixed(2));
-                  addLog("✖ صفقة خاسرة (-\$$_activeTradeAmount) | سعر الدخول: $_activeTradeEntryPrice -> الإغلاق: $exitPrice | مضاعفة الصفقة القادمة: \$$_currentTradeAmount");
-                } else {
+              // لا يتم احتساب ربح أو خسارة إلا إذا تغير الرصيد الفعلي في المنصة!
+              if (beforeBal > 0 && currentBal > 0) {
+                if (diff > 0.05) {
+                  // صفقة رابحة فعلياً زاد فيها الرصيد
+                  _wonTrades++;
                   _currentTradeAmount = _baseAmount;
-                  addLog("✖ صفقة خاسرة (-\$$_activeTradeAmount) | سعر الدخول: $_activeTradeEntryPrice -> الإغلاق: $exitPrice");
+                  addLog("✔ صفقة رابحة مؤكدة (+ \$${diff.toStringAsFixed(2)}) | الرصيد الآن: \$${currentBal.toStringAsFixed(2)} | العودة للمبلغ الأساسي: \$$_baseAmount");
+                } else if (diff < -0.05) {
+                  // صفقة خاسرة فعلياً نقص فيها الرصيد
+                  _lostTrades++;
+                  if (_useMartingale) {
+                    _currentTradeAmount = double.parse((_currentTradeAmount * _martingaleMultiplier).toStringAsFixed(2));
+                    addLog("✖ صفقة خاسرة مؤكدة (-\$${diff.abs().toStringAsFixed(2)}) | الرصيد الآن: \$${currentBal.toStringAsFixed(2)} | مضاعفة الصفقة القادمة: \$$_currentTradeAmount");
+                  } else {
+                    _currentTradeAmount = _baseAmount;
+                    addLog("✖ صفقة خاسرة مؤكدة (-\$${diff.abs().toStringAsFixed(2)}) | الرصيد الآن: \$${currentBal.toStringAsFixed(2)}");
+                  }
+                } else {
+                  // الرصيد لم يتغير (تعادل أو لم تُنفذ الصفقة)
+                  addLog("⚖ لم يتغير الرصيد بعد انتهاء الوقت (\$${currentBal.toStringAsFixed(2)}) — تعادل / لم تُحتسب خسارة أو ربح.");
                 }
               }
 
@@ -693,17 +763,15 @@ jobs:
               _remainingSeconds = 0;
               notifyListeners();
 
-              // فحص هدف الربح ووقف الخسارة
               if (_isAutoTrading) {
                 if (_initialSessionBalance > 0 && netProfit >= _takeProfitTarget) {
-                  stopAutoTrading(reason: "🎯 تم الوصول إلى هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)})");
+                  stopAutoTrading(reason: "🎯 تم الوصول إلى هدف الربح اليومي (+\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
                   return;
                 }
                 if (_initialSessionBalance > 0 && netProfit <= -_stopLossLimit) {
-                  stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)})");
+                  stopAutoTrading(reason: "🛑 تم الوصول إلى حد وقف الخسارة (\$${netProfit.toStringAsFixed(2)}) — توقف البوت تلقائياً!");
                   return;
                 }
-                // الدخول في الصفقة التالية بعد 3 ثوانٍ وفق قراءة المؤشر الجديدة
                 Future.delayed(const Duration(seconds: 3), () {
                   if (_isAutoTrading && !_isTradeOpen) {
                     _executeStrategyCycle();
@@ -716,10 +784,7 @@ jobs:
               stopAutoTrading();
               _tradeLifecycleTimer?.cancel();
               _isTradeOpen = false;
-              _pingTimer?.cancel();
               _webSyncTimer?.cancel();
-              await _socket?.close();
-              _socket = null;
               _isConnected = false;
               _isAuthenticated = false;
               addLog("تم قطع الاتصال بالسيرفر.");
@@ -734,7 +799,7 @@ jobs:
           }
           EOF
 
-      - name: Generate login_screen.dart (Captures Live Balance, Active Chart Pair & Ticks)
+      - name: Generate login_screen.dart (Per-Asset Normalized Price Stream without Mixing Pairs)
         run: |
           mkdir -p lib/screens
           cat << 'EOF' > lib/screens/login_screen.dart
@@ -772,45 +837,34 @@ jobs:
                 window.__qm_hooked = true;
                 window.__qm_sockets = [];
                 window.__qm_auth_token = null;
-                window.__qm_ws_url = null;
-                window.__qm_last_price = 0;
-                window.__qm_latest_asset = 'EURUSD_otc';
                 window.__qm_ws_balance = null;
-                window.__qm_prices = [];
-                window.__qm_asset_prices = {};
+                window.__qm_active_ws_key = '';
+                window.__qm_by_norm = {};
 
-                function recordPrice(asset, price) {
+                function normKey(s) {
+                  return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+                }
+
+                function recordAssetTick(asset, price) {
                   const p = parseFloat(price);
-                  if (isNaN(p) || p <= 0) return;
-                  window.__qm_last_price = p;
-                  if (asset && typeof asset === 'string') {
-                    window.__qm_latest_asset = asset;
-                    if (!window.__qm_asset_prices[asset]) window.__qm_asset_prices[asset] = [];
-                    const arr = window.__qm_asset_prices[asset];
-                    if (arr.length === 0 || arr[arr.length - 1] !== p) {
-                      arr.push(p);
-                      if (arr.length > 100) arr.shift();
-                    }
-                  }
-                  const g = window.__qm_prices;
-                  if (g.length === 0 || g[g.length - 1] !== p) {
-                    g.push(p);
-                    if (g.length > 100) g.shift();
+                  if (isNaN(p) || p <= 0 || !asset || typeof asset !== 'string') return;
+                  const k = normKey(asset);
+                  if (!k || k.length < 4) return;
+                  if (!window.__qm_by_norm[k]) window.__qm_by_norm[k] = [];
+                  const arr = window.__qm_by_norm[k];
+                  if (arr.length === 0 || arr[arr.length - 1] !== p) {
+                    arr.push(p);
+                    if (arr.length > 100) arr.shift();
                   }
                 }
 
                 function scanJsonForTicks(node) {
                   if (!node) return;
                   if (Array.isArray(node)) {
+                    // صيغة التيك المباشر: ["USDBRL_otc", 1728868860, 0.19188, 0]
                     if (node.length >= 3 && typeof node[0] === 'string' && typeof node[1] === 'number' && typeof node[2] === 'number') {
                       if (node[1] > 1500000000 && node[2] > 0) {
-                        recordPrice(node[0], node[2]);
-                        return;
-                      }
-                    }
-                    if (node.length >= 3 && typeof node[0] === 'number' && typeof node[1] === 'number' && typeof node[2] === 'number') {
-                      if (node[0] > 1500000000 && node[2] > 0 && node[2] < 1000000) {
-                        recordPrice(window.__qm_latest_asset || 'EURUSD_otc', node[2]);
+                        recordAssetTick(node[0], node[2]);
                         return;
                       }
                     }
@@ -823,17 +877,16 @@ jobs:
                     } else if (typeof node.balance === 'number' && node.balance >= 0) {
                       window.__qm_ws_balance = node.balance;
                     }
-                    if (typeof node.asset === 'string' && node.asset.length > 2) {
-                      window.__qm_latest_asset = node.asset;
+                    if (typeof node.asset === 'string' && Array.isArray(node.candles)) {
+                      const k = normKey(node.asset);
+                      window.__qm_active_ws_key = k;
+                      for (let i = 0; i < node.candles.length; i++) {
+                        const c = node.candles[i];
+                        if (Array.isArray(c) && c.length >= 3 && typeof c[2] === 'number') {
+                          recordAssetTick(node.asset, c[2]);
+                        }
+                      }
                     }
-                    if (typeof node.price === 'number' && node.price > 0) {
-                      recordPrice(node.asset || window.__qm_latest_asset, node.price);
-                    }
-                    if (typeof node.close === 'number' && node.close > 0) {
-                      recordPrice(node.asset || window.__qm_latest_asset, node.close);
-                    }
-                    if (Array.isArray(node.candles)) scanJsonForTicks(node.candles);
-                    if (Array.isArray(node.history)) scanJsonForTicks(node.history);
                     if (Array.isArray(node.quotes)) scanJsonForTicks(node.quotes);
                     if (Array.isArray(node.data)) scanJsonForTicks(node.data);
                   }
@@ -880,7 +933,6 @@ jobs:
                   try {
                     if (window.__qm_sockets.indexOf(this) === -1) {
                       window.__qm_sockets.push(this);
-                      window.__qm_ws_url = this.url;
                     }
                     attachListenerToSocket(this);
                     if (typeof data === 'string') {
@@ -890,7 +942,9 @@ jobs:
                       }
                       if (data.indexOf('instruments/update') !== -1 || data.indexOf('depth/follow') !== -1) {
                         const mAsset = data.match(/"asset"\\s*:\\s*"([^"]+)"/) || data.match(/"depth\\/follow"\\s*,\\s*"([^"]+)"/);
-                        if (mAsset && mAsset[1]) window.__qm_latest_asset = mAsset[1];
+                        if (mAsset && mAsset[1]) {
+                          window.__qm_active_ws_key = normKey(mAsset[1]);
+                        }
                       }
                     }
                   } catch (e) {}
@@ -900,7 +954,6 @@ jobs:
                 const OrigWS = window.WebSocket;
                 window.WebSocket = function(url, protocols) {
                   const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
-                  window.__qm_ws_url = url;
                   if (window.__qm_sockets.indexOf(ws) === -1) window.__qm_sockets.push(ws);
                   attachListenerToSocket(ws);
                   return ws;
@@ -926,37 +979,21 @@ jobs:
                 final cookies = await cookieManager.getCookies(url: WebUri("https://$host"));
                 final cookieHeader = cookies.map((c) => "${c.name}=${c.value}").join("; ");
 
-                String? foundToken;
-                for (var c in cookies) {
-                  final name = c.name.toLowerCase();
-                  if (name.contains('ssid') || name.contains('token') || name.contains('remember') || name.contains('session') || name.contains('lid')) {
-                    if (c.value.toString().isNotEmpty) {
-                      foundToken = c.value.toString();
-                      break;
-                    }
-                  }
-                }
-
                 final jsRes = await _webViewController!.evaluateJavascript(source: '''
                   (function() {
                     try {
                       let tok = window.__qm_auth_token || (window.settings && window.settings.token) || '';
                       let bal = '';
-                      if (window.__qm_ws_balance !== null && window.__qm_ws_balance !== undefined) {
-                        bal = String(window.__qm_ws_balance);
-                      }
-                      if (!bal) {
-                        const topNodes = document.querySelectorAll('div, span, b, p');
-                        for (let i = 0; i < topNodes.length; i++) {
-                          const el = topNodes[i];
-                          if (el.children.length <= 1 && el.innerText) {
-                            const rect = el.getBoundingClientRect();
-                            if (rect.top >= 0 && rect.top < 140 && rect.width > 10) {
-                              const m = el.innerText.match(/[\x24€£৳₹¥]\s*[0-9,]+(\.[0-9]{1,2})?/);
-                              if (m && m[0]) {
-                                bal = m[0];
-                                break;
-                              }
+                      const topNodes = document.querySelectorAll('div, span, b, p');
+                      for (let i = 0; i < topNodes.length; i++) {
+                        const el = topNodes[i];
+                        if (el.children.length <= 1 && el.innerText) {
+                          const rect = el.getBoundingClientRect();
+                          if (rect.top >= 0 && rect.top < 140 && rect.width > 10) {
+                            const m = el.innerText.match(/[\\x24€£৳₹¥]\\s*[0-9,]+(\\.[0-9]{1,2})?/);
+                            if (m && m[0]) {
+                              bal = m[0];
+                              break;
                             }
                           }
                         }
@@ -988,16 +1025,12 @@ jobs:
                   }
                 }
 
-                final effectiveToken = jsToken.isNotEmpty
-                    ? jsToken
-                    : (foundToken ?? (cookies.isNotEmpty ? cookies.first.value.toString() : "active_web_session"));
-
-                final bool isSignedIn = isTradeRoom || jsToken.isNotEmpty || foundToken != null || (!urlStr.contains("sign-in") && !urlStr.contains("login") && cookies.length >= 2);
+                final bool isSignedIn = isTradeRoom || jsToken.isNotEmpty || (!urlStr.contains("sign-in") && !urlStr.contains("login") && cookies.length >= 2);
 
                 if (isSignedIn || manualTrigger) {
                   service.attachWebViewController(_webViewController!);
                   await service.connect(
-                    ssidToken: effectiveToken,
+                    ssidToken: jsToken.isNotEmpty ? jsToken : "active_web_session",
                     isRealAccount: service.accountType == "real",
                     domain: host,
                     cookieHeader: cookieHeader,
@@ -1239,7 +1272,7 @@ jobs:
           }
           EOF
 
-      - name: Generate main.dart (Full Quotex Pairs List + Live Trade Countdown + Accurate Balance)
+      - name: Generate main.dart (Full 36 Quotex Pairs + Strategy Live Badge + Net Profit Display)
         run: |
           cat << 'EOF' > lib/main.dart
           import 'package:flutter/material.dart';
@@ -1480,6 +1513,15 @@ jobs:
                                       color: Color(0xFF10B981),
                                     ),
                                   ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    "صافي ربح الجلسة: ${service.netProfit >= 0 ? '+' : ''}\$${service.netProfit.toStringAsFixed(2)}",
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold,
+                                      color: service.netProfit >= 0 ? Colors.greenAccent : Colors.redAccent,
+                                    ),
+                                  ),
                                 ],
                               ),
                               Container(
@@ -1525,10 +1567,14 @@ jobs:
                             child: Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
-                                Text(
-                                  "الزوج: ${service.activeAsset} | السعر: ${service.lastPrice > 0 ? service.lastPrice.toStringAsFixed(5) : '...'}",
-                                  style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Colors.cyanAccent),
+                                Flexible(
+                                  child: Text(
+                                    "الزوج: ${service.activeAsset} | السعر: ${service.lastPrice > 0 ? service.lastPrice.toStringAsFixed(5) : 'بانتظار الشارت...'}",
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Colors.cyanAccent),
+                                  ),
                                 ),
+                                const SizedBox(width: 6),
                                 Text(
                                   service.isTradeOpen
                                       ? "⏳ صفقة جارية (${service.remainingSeconds}s)"
@@ -1691,24 +1737,63 @@ jobs:
                                     contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
                                   ),
                                   items: const [
-                                    DropdownMenuItem(value: "AUTO_CHART", child: Text("تلقائي: الزوج المفتوح بالشارت")),
-                                    DropdownMenuItem(value: "EURUSD_otc", child: Text("EUR/USD (OTC)")),
-                                    DropdownMenuItem(value: "GBPUSD_otc", child: Text("GBP/USD (OTC)")),
-                                    DropdownMenuItem(value: "USDJPY_otc", child: Text("USD/JPY (OTC)")),
-                                    DropdownMenuItem(value: "AUDCAD_otc", child: Text("AUD/CAD (OTC)")),
-                                    DropdownMenuItem(value: "EURGBP_otc", child: Text("EUR/GBP (OTC)")),
-                                    DropdownMenuItem(value: "USDCHF_otc", child: Text("USD/CHF (OTC)")),
-                                    DropdownMenuItem(value: "NZDCAD_otc", child: Text("NZD/CAD (OTC)")),
-                                    DropdownMenuItem(value: "USDBRL_otc", child: Text("USD/BRL (OTC)")),
-                                    DropdownMenuItem(value: "USDEGP_otc", child: Text("USD/EGP (OTC)")),
-                                    DropdownMenuItem(value: "USDTRY_otc", child: Text("USD/TRY (OTC)")),
-                                    DropdownMenuItem(value: "USDINR_otc", child: Text("USD/INR (OTC)")),
-                                    DropdownMenuItem(value: "USDPKR_otc", child: Text("USD/PKR (OTC)")),
-                                    DropdownMenuItem(value: "USDBDT_otc", child: Text("USD/BDT (OTC)")),
-                                    DropdownMenuItem(value: "XAUUSD_otc", child: Text("Gold / الذهب (OTC)")),
-                                    DropdownMenuItem(value: "BTCUSD_otc", child: Text("Bitcoin (OTC)")),
-                                    DropdownMenuItem(value: "EURUSD", child: Text("EUR/USD (مباشر)")),
-                                    DropdownMenuItem(value: "GBPUSD", child: Text("GBP/USD (مباشر)")),
+                                    DropdownMenuItem(value: "AUTO_CHART", child: Text("تلقائي: الزوج المفتوح بالشارت حالياً")),
+                                    // أزواج العملات الرئيسية OTC
+                                    DropdownMenuItem(value: "EUR/USD (OTC)", child: Text("EUR/USD (OTC)")),
+                                    DropdownMenuItem(value: "GBP/USD (OTC)", child: Text("GBP/USD (OTC)")),
+                                    DropdownMenuItem(value: "USD/JPY (OTC)", child: Text("USD/JPY (OTC)")),
+                                    DropdownMenuItem(value: "AUD/CAD (OTC)", child: Text("AUD/CAD (OTC)")),
+                                    DropdownMenuItem(value: "AUD/CHF (OTC)", child: Text("AUD/CHF (OTC)")),
+                                    DropdownMenuItem(value: "AUD/JPY (OTC)", child: Text("AUD/JPY (OTC)")),
+                                    DropdownMenuItem(value: "AUD/NZD (OTC)", child: Text("AUD/NZD (OTC)")),
+                                    DropdownMenuItem(value: "AUD/USD (OTC)", child: Text("AUD/USD (OTC)")),
+                                    DropdownMenuItem(value: "CAD/CHF (OTC)", child: Text("CAD/CHF (OTC)")),
+                                    DropdownMenuItem(value: "CAD/JPY (OTC)", child: Text("CAD/JPY (OTC)")),
+                                    DropdownMenuItem(value: "CHF/JPY (OTC)", child: Text("CHF/JPY (OTC)")),
+                                    DropdownMenuItem(value: "EUR/AUD (OTC)", child: Text("EUR/AUD (OTC)")),
+                                    DropdownMenuItem(value: "EUR/CAD (OTC)", child: Text("EUR/CAD (OTC)")),
+                                    DropdownMenuItem(value: "EUR/CHF (OTC)", child: Text("EUR/CHF (OTC)")),
+                                    DropdownMenuItem(value: "EUR/GBP (OTC)", child: Text("EUR/GBP (OTC)")),
+                                    DropdownMenuItem(value: "EUR/JPY (OTC)", child: Text("EUR/JPY (OTC)")),
+                                    DropdownMenuItem(value: "EUR/NZD (OTC)", child: Text("EUR/NZD (OTC)")),
+                                    DropdownMenuItem(value: "GBP/AUD (OTC)", child: Text("GBP/AUD (OTC)")),
+                                    DropdownMenuItem(value: "GBP/CAD (OTC)", child: Text("GBP/CAD (OTC)")),
+                                    DropdownMenuItem(value: "GBP/CHF (OTC)", child: Text("GBP/CHF (OTC)")),
+                                    DropdownMenuItem(value: "GBP/JPY (OTC)", child: Text("GBP/JPY (OTC)")),
+                                    DropdownMenuItem(value: "GBP/NZD (OTC)", child: Text("GBP/NZD (OTC)")),
+                                    DropdownMenuItem(value: "NZD/CAD (OTC)", child: Text("NZD/CAD (OTC)")),
+                                    DropdownMenuItem(value: "NZD/CHF (OTC)", child: Text("NZD/CHF (OTC)")),
+                                    DropdownMenuItem(value: "NZD/JPY (OTC)", child: Text("NZD/JPY (OTC)")),
+                                    DropdownMenuItem(value: "NZD/USD (OTC)", child: Text("NZD/USD (OTC)")),
+                                    DropdownMenuItem(value: "USD/CAD (OTC)", child: Text("USD/CAD (OTC)")),
+                                    DropdownMenuItem(value: "USD/CHF (OTC)", child: Text("USD/CHF (OTC)")),
+                                    // أزواج الأسواق الناشئة الشائعة في المنصة
+                                    DropdownMenuItem(value: "USD/BRL (OTC)", child: Text("USD/BRL (OTC)")),
+                                    DropdownMenuItem(value: "USD/EGP (OTC)", child: Text("USD/EGP (OTC)")),
+                                    DropdownMenuItem(value: "USD/TRY (OTC)", child: Text("USD/TRY (OTC)")),
+                                    DropdownMenuItem(value: "USD/INR (OTC)", child: Text("USD/INR (OTC)")),
+                                    DropdownMenuItem(value: "USD/PKR (OTC)", child: Text("USD/PKR (OTC)")),
+                                    DropdownMenuItem(value: "USD/BDT (OTC)", child: Text("USD/BDT (OTC)")),
+                                    DropdownMenuItem(value: "USD/ARS (OTC)", child: Text("USD/ARS (OTC)")),
+                                    DropdownMenuItem(value: "USD/MXN (OTC)", child: Text("USD/MXN (OTC)")),
+                                    DropdownMenuItem(value: "USD/NGN (OTC)", child: Text("USD/NGN (OTC)")),
+                                    DropdownMenuItem(value: "USD/PHP (OTC)", child: Text("USD/PHP (OTC)")),
+                                    DropdownMenuItem(value: "USD/IDR (OTC)", child: Text("USD/IDR (OTC)")),
+                                    DropdownMenuItem(value: "USD/COP (OTC)", child: Text("USD/COP (OTC)")),
+                                    DropdownMenuItem(value: "USD/DZD (OTC)", child: Text("USD/DZD (OTC)")),
+                                    // السلع والعملات الرقمية
+                                    DropdownMenuItem(value: "Gold (OTC)", child: Text("Gold / الذهب (OTC)")),
+                                    DropdownMenuItem(value: "Silver (OTC)", child: Text("Silver / الفضة (OTC)")),
+                                    DropdownMenuItem(value: "UKBrent (OTC)", child: Text("UKBrent / النفط (OTC)")),
+                                    DropdownMenuItem(value: "USCrude (OTC)", child: Text("USCrude / الخام (OTC)")),
+                                    DropdownMenuItem(value: "Bitcoin (OTC)", child: Text("Bitcoin (OTC)")),
+                                    DropdownMenuItem(value: "Ethereum (OTC)", child: Text("Ethereum (OTC)")),
+                                    // الأزواج المباشرة
+                                    DropdownMenuItem(value: "EUR/USD", child: Text("EUR/USD (مباشر)")),
+                                    DropdownMenuItem(value: "GBP/USD", child: Text("GBP/USD (مباشر)")),
+                                    DropdownMenuItem(value: "USD/JPY", child: Text("USD/JPY (مباشر)")),
+                                    DropdownMenuItem(value: "AUD/USD", child: Text("AUD/USD (مباشر)")),
+                                    DropdownMenuItem(value: "USD/CAD", child: Text("USD/CAD (مباشر)")),
                                   ],
                                   onChanged: (val) {
                                     setState(() => _selectedAsset = val!);
