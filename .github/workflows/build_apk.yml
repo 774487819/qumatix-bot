@@ -38,9 +38,9 @@ jobs:
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Pro Automated Trading Bot"
+          description: "QuMatix Pro AI Real Indicator Trading Bot"
           publish_to: 'none'
-          version: 3.0.0+3
+          version: 3.1.0+4
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -100,7 +100,7 @@ jobs:
           </manifest>
           EOF
 
-      - name: Generate quotex_service.dart (Hybrid WebSocket + WebView Bridge Engine)
+      - name: Generate quotex_service.dart (Real Market Tick Stream + Multi-Indicator Engine)
         run: |
           mkdir -p lib/services
           cat << 'EOF' > lib/services/quotex_service.dart
@@ -139,8 +139,11 @@ jobs:
             String _strategy = "qumatix_rsi_ema";
 
             double _lastPrice = 0.0;
-            double _currentRsi = 52.4;
-            String _lastSignal = "جاهز لتحليل السوق";
+            double _emaFast = 0.0;
+            double _emaSlow = 0.0;
+            double _currentRsi = 50.0;
+            double _priceMomentum = 0.0;
+            String _lastSignal = "بانتظار قراءات السوق الحية...";
             int _totalTrades = 0;
             int _wonTrades = 0;
             int _lostTrades = 0;
@@ -166,7 +169,11 @@ jobs:
             double get stopLossLimit => _stopLossLimit;
             String get strategy => _strategy;
             double get lastPrice => _lastPrice;
+            double get emaFast => _emaFast;
+            double get emaSlow => _emaSlow;
             double get currentRsi => _currentRsi;
+            double get priceMomentum => _priceMomentum;
+            int get ticksCount => _priceHistory.length;
             String get lastSignal => _lastSignal;
             int get totalTrades => _totalTrades;
             int get wonTrades => _wonTrades;
@@ -195,6 +202,7 @@ jobs:
               if (asset != null && asset != _activeAsset) {
                 _activeAsset = asset;
                 _priceHistory.clear();
+                _lastPrice = 0.0;
                 if (_isConnected) {
                   _subscribeToAsset(_activeAsset);
                 }
@@ -247,6 +255,7 @@ jobs:
               addLog("تم ربط الحساب بنجاح عبر السيرفر ($domain) ✔");
               notifyListeners();
 
+              _subscribeToAsset(_activeAsset);
               _startWebSyncTimer();
 
               final List<String> fallbackDomains = [
@@ -289,7 +298,7 @@ jobs:
 
             void _startWebSyncTimer() {
               _webSyncTimer?.cancel();
-              _webSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+              _webSyncTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) async {
                 if (!_isConnected || _webViewController == null) return;
                 try {
                   final res = await _webViewController!.evaluateJavascript(source: '''
@@ -298,16 +307,25 @@ jobs:
                         let balText = '';
                         const balEl = document.querySelector('[class*="balance"], [class*="usermenu__info-balance"], .section-deal__balance');
                         if (balEl) balText = balEl.innerText.trim();
-                        let priceVal = window.__qm_last_price || 0;
-                        const priceEl = document.querySelector('[class*="chart-price"], .current-price');
-                        if (!priceVal && priceEl) {
-                          const p = parseFloat(priceEl.innerText.replace(/[^0-9.]/g, ''));
-                          if (!isNaN(p)) priceVal = p;
+
+                        const targetAsset = '$_activeAsset';
+                        let prices = [];
+                        if (window.__qm_asset_prices && window.__qm_asset_prices[targetAsset] && window.__qm_asset_prices[targetAsset].length > 0) {
+                          prices = window.__qm_asset_prices[targetAsset];
+                        } else if (window.__qm_prices && window.__qm_prices.length > 0) {
+                          prices = window.__qm_prices;
                         }
-                        return JSON.stringify({balance: balText, price: priceVal, token: window.__qm_auth_token || ''});
+
+                        return JSON.stringify({
+                          balance: balText,
+                          prices: prices.slice(-60),
+                          latestAsset: window.__qm_latest_asset || '',
+                          socketsCount: window.__qm_sockets ? window.__qm_sockets.length : 0
+                        });
                       } catch(e) { return '{}'; }
                     })();
                   ''');
+
                   if (res != null && res is String && res.contains('{')) {
                     final cleanJson = res.startsWith('"') ? jsonDecode(res) : res;
                     final map = cleanJson is String ? jsonDecode(cleanJson) : cleanJson;
@@ -323,12 +341,26 @@ jobs:
                           _balance = numVal;
                         }
                       }
-                      final pVal = map['price'];
-                      if (pVal is num && pVal > 0) {
-                        _lastPrice = pVal.toDouble();
-                        _priceHistory.add(_lastPrice);
-                        if (_priceHistory.length > 60) _priceHistory.removeAt(0);
-                        _calculateIndicators();
+
+                      final rawPrices = map['prices'];
+                      if (rawPrices is List && rawPrices.isNotEmpty) {
+                        bool updated = false;
+                        for (final item in rawPrices) {
+                          if (item is num && item > 0) {
+                            final d = item.toDouble();
+                            if (_priceHistory.isEmpty || _priceHistory.last != d) {
+                              _priceHistory.add(d);
+                              _lastPrice = d;
+                              updated = true;
+                            }
+                          }
+                        }
+                        while (_priceHistory.length > 80) {
+                          _priceHistory.removeAt(0);
+                        }
+                        if (updated) {
+                          _calculateIndicators();
+                        }
                       }
                       notifyListeners();
                     }
@@ -346,11 +378,33 @@ jobs:
               });
             }
 
-            void _subscribeToAsset(String asset) {
-              if (!_isConnected || _socket == null) return;
-              _socket?.add('42["instruments/update",{"asset":"$asset","period":$_tradeDuration}]');
-              _socket?.add('42["depth/follow","$asset"]');
-              addLog("تم ضبط زوج التداول النشط على: $asset");
+            Future<void> _subscribeToAsset(String asset) async {
+              if (_socket != null) {
+                try {
+                  _socket!.add('42["instruments/update",{"asset":"$asset","period":$_tradeDuration}]');
+                  _socket!.add('42["depth/follow","$asset"]');
+                  _socket!.add('42["chart_notification/get",{"asset":"$asset","version":"1.0.0"}]');
+                } catch (_) {}
+              }
+              if (_webViewController != null) {
+                try {
+                  await _webViewController!.evaluateJavascript(source: '''
+                    (function() {
+                      try {
+                        if (window.__qm_sockets && window.__qm_sockets.length > 0) {
+                          for (let ws of window.__qm_sockets) {
+                            if (ws && ws.readyState === 1) {
+                              ws.send('42["instruments/update",{"asset":"$asset","period":$_tradeDuration}]');
+                              ws.send('42["depth/follow","$asset"]');
+                            }
+                          }
+                        }
+                      } catch(e) {}
+                    })();
+                  ''');
+                } catch (_) {}
+              }
+              addLog("تم الاشتراك في تدفق الأسعار الحي للزوج: $asset");
             }
 
             void _handleIncomingData(String rawMsg, String token) {
@@ -387,39 +441,67 @@ jobs:
                         notifyListeners();
                       }
                     }
-                  } else if (eventName.contains("quotes") || eventName.contains("candles") || eventName.contains("depth")) {
+                  } else {
                     _extractLivePrice(payload);
                   }
                 } catch (_) {}
               }
             }
 
-            void _extractLivePrice(dynamic payload) {
+            void _extractLivePrice(dynamic node) {
               try {
-                double? price;
-                if (payload is List && payload.isNotEmpty) {
-                  final first = payload.last;
-                  if (first is List && first.length >= 2 && first[1] is num) {
-                    price = (first[1] as num).toDouble();
-                  } else if (first is Map && first['price'] is num) {
-                    price = (first['price'] as num).toDouble();
+                if (node is List) {
+                  if (node.length >= 3 && node[0] is String && node[1] is num && node[2] is num) {
+                    final price = (node[2] as num).toDouble();
+                    if (price > 0) _pushPriceTick(price);
+                    return;
                   }
-                } else if (payload is Map && payload['price'] is num) {
-                  price = (payload['price'] as num).toDouble();
-                }
-
-                if (price != null && price > 0) {
-                  _lastPrice = price;
-                  _priceHistory.add(price);
-                  if (_priceHistory.length > 60) _priceHistory.removeAt(0);
-                  _calculateIndicators();
-                  notifyListeners();
+                  for (final item in node) {
+                    _extractLivePrice(item);
+                  }
+                } else if (node is Map) {
+                  if (node['price'] is num) {
+                    _pushPriceTick((node['price'] as num).toDouble());
+                  } else if (node['close'] is num) {
+                    _pushPriceTick((node['close'] as num).toDouble());
+                  }
+                  if (node['candles'] is List) _extractLivePrice(node['candles']);
+                  if (node['quotes'] is List) _extractLivePrice(node['quotes']);
                 }
               } catch (_) {}
             }
 
+            void _pushPriceTick(double price) {
+              if (price <= 0) return;
+              if (_priceHistory.isEmpty || _priceHistory.last != price) {
+                _lastPrice = price;
+                _priceHistory.add(price);
+                if (_priceHistory.length > 80) _priceHistory.removeAt(0);
+                _calculateIndicators();
+                notifyListeners();
+              }
+            }
+
+            double _computeEma(List<double> data, int period) {
+              if (data.isEmpty) return 0.0;
+              if (data.length < period) {
+                return data.reduce((a, b) => a + b) / data.length;
+              }
+              final double k = 2.0 / (period + 1);
+              double ema = data.sublist(0, period).reduce((a, b) => a + b) / period;
+              for (int i = period; i < data.length; i++) {
+                ema = (data[i] * k) + (ema * (1.0 - k));
+              }
+              return ema;
+            }
+
             void _calculateIndicators() {
-              if (_priceHistory.length < 6) return;
+              if (_priceHistory.length < 3) return;
+
+              _emaFast = _computeEma(_priceHistory, 5);
+              _emaSlow = _computeEma(_priceHistory, 15);
+              _priceMomentum = _priceHistory.last - _priceHistory[max(0, _priceHistory.length - 4)];
+
               final int window = min(14, _priceHistory.length - 1);
               double gains = 0.0;
               double losses = 0.0;
@@ -433,8 +515,10 @@ jobs:
               }
               final avgGain = gains / window;
               final avgLoss = losses / window;
-              if (avgLoss == 0) {
-                _currentRsi = 75.0;
+              if (avgLoss == 0 && avgGain == 0) {
+                _currentRsi = 50.0;
+              } else if (avgLoss == 0) {
+                _currentRsi = 85.0;
               } else {
                 final rs = avgGain / avgLoss;
                 _currentRsi = 100.0 - (100.0 / (1.0 + rs));
@@ -488,7 +572,8 @@ jobs:
               }
               _isAutoTrading = true;
               _currentTradeAmount = _baseAmount;
-              addLog("تم تفعيل البوت الآلي QuMatix AI على $_activeAsset (المدة: ${_tradeDuration}s) 🤖");
+              _subscribeToAsset(_activeAsset);
+              addLog("تم تفعيل البوت الآلي المبني على المؤشرات الحية ($_strategy) على $_activeAsset 🤖");
               notifyListeners();
 
               _autoTradeTimer?.cancel();
@@ -497,7 +582,11 @@ jobs:
                 _executeStrategyCycle();
               });
 
-              _executeStrategyCycle();
+              Future.delayed(const Duration(seconds: 2), () {
+                if (_isAutoTrading && _isConnected) {
+                  _executeStrategyCycle();
+                }
+              });
             }
 
             void stopAutoTrading({String? reason}) {
@@ -507,37 +596,91 @@ jobs:
               notifyListeners();
             }
 
-            void _executeStrategyCycle() {
-              String direction = "call";
-
-              if (_priceHistory.length >= 6) {
-                final int shortLen = min(3, _priceHistory.length);
-                final int longLen = min(8, _priceHistory.length);
-                final double shortMa = _priceHistory.sublist(_priceHistory.length - shortLen).reduce((a, b) => a + b) / shortLen;
-                final double longMa = _priceHistory.sublist(_priceHistory.length - longLen).reduce((a, b) => a + b) / longLen;
-
-                if (_strategy == "qumatix_rsi_ema") {
-                  if (_currentRsi < 42 || shortMa >= longMa) {
-                    direction = "call";
-                    _lastSignal = "شراء (CALL) | RSI: ${_currentRsi.toStringAsFixed(1)}";
-                  } else {
-                    direction = "put";
-                    _lastSignal = "بيع (PUT) | RSI: ${_currentRsi.toStringAsFixed(1)}";
-                  }
-                } else if (_strategy == "trend_momentum") {
-                  direction = shortMa >= longMa ? "call" : "put";
-                  _lastSignal = direction == "call" ? "زخم صاعد (CALL)" : "زخم هابط (PUT)";
-                } else {
-                  direction = _currentRsi <= 50 ? "call" : "put";
-                  _lastSignal = direction == "call" ? "ارتداد صاعد (CALL)" : "ارتداد هابط (PUT)";
-                }
-              } else {
-                direction = (_totalTrades % 2 == 0) ? "call" : "put";
-                _lastSignal = direction == "call" ? "إشارة شراء (CALL)" : "إشارة بيع (PUT)";
+            Future<void> _executeStrategyCycle() async {
+              // تحديث فوري للأسعار من الشارت قبل اتخاذ القرار
+              if (_webViewController != null) {
+                await _subscribeToAsset(_activeAsset);
               }
 
-              addLog("تحليل QuMatix AI: $_lastSignal");
-              placeOrder(
+              // منع أي تداول عشوائي أو تناوبي إذا لم تتوفر قراءات حقيقية للسوق
+              if (_priceHistory.length < 4) {
+                _lastSignal = "تجميع أسعار السوق الحية (${_priceHistory.length}/4)...";
+                addLog("⏳ بانتظار استلام قراءات السعر الحي من الشارت (${_priceHistory.length}/4) — لن يدخل البوت صفقة عشوائية.");
+                notifyListeners();
+                return;
+              }
+
+              _calculateIndicators();
+
+              final double price = _lastPrice;
+              final double lastStep = _priceHistory.last - _priceHistory[_priceHistory.length - 2];
+              String? direction;
+              String reason = "";
+
+              if (_strategy == "qumatix_rsi_ema") {
+                // خوارزمية QuMatix الذكية: تقاطع المتوسطات الأسية EMA5/EMA15 + فلتر RSI + الزخم السعري
+                if (_currentRsi <= 33 && lastStep >= 0) {
+                  direction = "call";
+                  reason = "تشبع بيعي وارتداد صاعد (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price)";
+                } else if (_currentRsi >= 67 && lastStep <= 0) {
+                  direction = "put";
+                  reason = "تشبع شرائي وارتداد هابط (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price)";
+                } else if (_emaFast > _emaSlow && _priceMomentum > 0 && _currentRsi < 68) {
+                  direction = "call";
+                  reason = "تقاطع صاعد EMA5>EMA15 وزخم إيجابي (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price)";
+                } else if (_emaFast < _emaSlow && _priceMomentum < 0 && _currentRsi > 32) {
+                  direction = "put";
+                  reason = "تقاطع هابط EMA5<EMA15 وزخم سلبي (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price)";
+                } else if (_priceMomentum > 0) {
+                  direction = "call";
+                  reason = "ميل سعري صاعد (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price)";
+                } else if (_priceMomentum < 0) {
+                  direction = "put";
+                  reason = "ميل سعري هابط (RSI: ${_currentRsi.toStringAsFixed(1)} | السعر: $price)";
+                } else {
+                  _lastSignal = "السوق مستقر (RSI: ${_currentRsi.toStringAsFixed(1)}) — انتظار حركة";
+                  addLog("⏸ حركة السعر محايدة تماماً عند $price — انتظار تحرك السعر الفعلي.");
+                  notifyListeners();
+                  return;
+                }
+              } else if (_strategy == "trend_momentum") {
+                // استراتيجية تتبع الزخم والاتجاه الفعلي للشموع
+                if (_emaFast >= _emaSlow && _priceMomentum >= 0) {
+                  direction = "call";
+                  reason = "اتجاه صاعد مستمر EMA5>=EMA15 (السعر: $price | RSI: ${_currentRsi.toStringAsFixed(1)})";
+                } else if (_emaFast < _emaSlow && _priceMomentum <= 0) {
+                  direction = "put";
+                  reason = "اتجاه هابط مستمر EMA5<EMA15 (السعر: $price | RSI: ${_currentRsi.toStringAsFixed(1)})";
+                } else {
+                  direction = _priceMomentum >= 0 ? "call" : "put";
+                  reason = "زخم فوري ${direction == 'call' ? 'صاعد' : 'هابط'} (السعر: $price | RSI: ${_currentRsi.toStringAsFixed(1)})";
+                }
+              } else {
+                // قناص الارتداد السعري (Bollinger Bands + RSI Reversal)
+                final double mean = _priceHistory.reduce((a, b) => a + b) / _priceHistory.length;
+                double variance = 0.0;
+                for (final p in _priceHistory) {
+                  variance += (p - mean) * (p - mean);
+                }
+                final double stdDev = sqrt(variance / _priceHistory.length);
+                final double upperBand = mean + (1.8 * stdDev);
+                final double lowerBand = mean - (1.8 * stdDev);
+
+                if (price <= lowerBand || _currentRsi < 42) {
+                  direction = "call";
+                  reason = "ارتداد من القاع السعري Bollinger/RSI (السعر: $price | RSI: ${_currentRsi.toStringAsFixed(1)})";
+                } else if (price >= upperBand || _currentRsi > 58) {
+                  direction = "put";
+                  reason = "ارتداد من القمة السعرية Bollinger/RSI (السعر: $price | RSI: ${_currentRsi.toStringAsFixed(1)})";
+                } else {
+                  direction = lastStep < 0 ? "call" : "put";
+                  reason = "ارتداد تصحيحي عند $price (RSI: ${_currentRsi.toStringAsFixed(1)})";
+                }
+              }
+
+              _lastSignal = "${direction.toUpperCase()} | RSI: ${_currentRsi.toStringAsFixed(1)}";
+              addLog("📊 قرار المؤشر الحي: $reason => ${direction.toUpperCase()}");
+              await placeOrder(
                 asset: _activeAsset,
                 direction: direction,
                 amount: _currentTradeAmount,
@@ -626,7 +769,7 @@ jobs:
           }
           EOF
 
-      - name: Generate login_screen.dart (Embedded Live Platform & Instant Session Detector)
+      - name: Generate login_screen.dart (Full Binary & Text WebSocket Tick Interceptor)
         run: |
           mkdir -p lib/screens
           cat << 'EOF' > lib/screens/login_screen.dart
@@ -665,24 +808,122 @@ jobs:
                 window.__qm_sockets = [];
                 window.__qm_auth_token = null;
                 window.__qm_ws_url = null;
-                window.__qm_last_price = null;
+                window.__qm_last_price = 0;
+                window.__qm_latest_asset = '';
+                window.__qm_prices = [];
+                window.__qm_asset_prices = {};
+
+                function recordPrice(asset, price) {
+                  const p = parseFloat(price);
+                  if (isNaN(p) || p <= 0) return;
+                  window.__qm_last_price = p;
+                  if (asset && typeof asset === 'string') {
+                    window.__qm_latest_asset = asset;
+                    if (!window.__qm_asset_prices[asset]) window.__qm_asset_prices[asset] = [];
+                    const arr = window.__qm_asset_prices[asset];
+                    if (arr.length === 0 || arr[arr.length - 1] !== p) {
+                      arr.push(p);
+                      if (arr.length > 100) arr.shift();
+                    }
+                  }
+                  const g = window.__qm_prices;
+                  if (g.length === 0 || g[g.length - 1] !== p) {
+                    g.push(p);
+                    if (g.length > 100) g.shift();
+                  }
+                }
+
+                function scanJsonForTicks(node) {
+                  if (!node) return;
+                  if (Array.isArray(node)) {
+                    if (node.length >= 3 && typeof node[0] === 'string' && typeof node[1] === 'number' && typeof node[2] === 'number') {
+                      if (node[1] > 1500000000 && node[2] > 0) {
+                        recordPrice(node[0], node[2]);
+                        return;
+                      }
+                    }
+                    if (node.length >= 3 && typeof node[0] === 'number' && typeof node[1] === 'number' && typeof node[2] === 'number') {
+                      if (node[0] > 1500000000 && node[2] > 0 && node[2] < 1000000) {
+                        recordPrice(window.__qm_latest_asset || 'active', node[2]);
+                        return;
+                      }
+                    }
+                    for (let i = 0; i < node.length; i++) {
+                      scanJsonForTicks(node[i]);
+                    }
+                  } else if (typeof node === 'object') {
+                    if (typeof node.asset === 'string') window.__qm_latest_asset = node.asset;
+                    if (typeof node.price === 'number' && node.price > 0) {
+                      recordPrice(node.asset || window.__qm_latest_asset, node.price);
+                    }
+                    if (typeof node.close === 'number' && node.close > 0) {
+                      recordPrice(node.asset || window.__qm_latest_asset, node.close);
+                    }
+                    if (Array.isArray(node.candles)) scanJsonForTicks(node.candles);
+                    if (Array.isArray(node.history)) scanJsonForTicks(node.history);
+                    if (Array.isArray(node.quotes)) scanJsonForTicks(node.quotes);
+                    if (Array.isArray(node.data)) scanJsonForTicks(node.data);
+                  }
+                }
+
+                function handleRawText(txt) {
+                  if (!txt || typeof txt !== 'string' || txt.length < 4) return;
+                  try {
+                    const b1 = txt.indexOf('[');
+                    const b2 = txt.indexOf('{');
+                    let idx = -1;
+                    if (b1 !== -1 && (b2 === -1 || b1 < b2)) idx = b1;
+                    else if (b2 !== -1) idx = b2;
+                    if (idx === -1) return;
+                    const parsed = JSON.parse(txt.substring(idx));
+                    scanJsonForTicks(parsed);
+                  } catch (e) {}
+                }
+
+                function attachListenerToSocket(ws) {
+                  if (!ws || ws.__qm_listened) return;
+                  ws.__qm_listened = true;
+                  ws.addEventListener('message', function(ev) {
+                    try {
+                      const d = ev.data;
+                      if (typeof d === 'string') {
+                        handleRawText(d);
+                      } else if (d instanceof ArrayBuffer) {
+                        const dec = new TextDecoder('utf-8').decode(new Uint8Array(d));
+                        handleRawText(dec);
+                      } else if (typeof Blob !== 'undefined' && d instanceof Blob) {
+                        const reader = new FileReader();
+                        reader.onload = function() {
+                          if (typeof reader.result === 'string') handleRawText(reader.result);
+                        };
+                        reader.readAsText(d);
+                      }
+                    } catch (e) {}
+                  });
+                }
+
+                const origProtoSend = WebSocket.prototype.send;
+                WebSocket.prototype.send = function(data) {
+                  try {
+                    if (window.__qm_sockets.indexOf(this) === -1) {
+                      window.__qm_sockets.push(this);
+                      window.__qm_ws_url = this.url;
+                    }
+                    attachListenerToSocket(this);
+                    if (typeof data === 'string' && data.indexOf('authorization') !== -1) {
+                      const m = data.match(/"session"\\s*:\\s*"([^"]+)"/);
+                      if (m && m[1]) window.__qm_auth_token = m[1];
+                    }
+                  } catch (e) {}
+                  return origProtoSend.apply(this, arguments);
+                };
 
                 const OrigWS = window.WebSocket;
                 window.WebSocket = function(url, protocols) {
                   const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
                   window.__qm_ws_url = url;
-                  window.__qm_sockets.push(ws);
-
-                  const origSend = ws.send;
-                  ws.send = function(data) {
-                    try {
-                      if (typeof data === 'string' && data.indexOf('authorization') !== -1) {
-                        const m = data.match(/"session"\\s*:\\s*"([^"]+)"/);
-                        if (m && m[1]) window.__qm_auth_token = m[1];
-                      }
-                    } catch(e) {}
-                    return origSend.apply(this, arguments);
-                  };
+                  if (window.__qm_sockets.indexOf(ws) === -1) window.__qm_sockets.push(ws);
+                  attachListenerToSocket(ws);
                   return ws;
                 };
                 window.WebSocket.prototype = OrigWS.prototype;
@@ -776,7 +1017,7 @@ jobs:
                   if (mounted && manualTrigger) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text("تم ربط حساب التداول بالبوت بنجاح! جاهز للتداول الآلي ✔"),
+                        content: Text("تم ربط حساب التداول بالبوت وتفعيل قراءة المؤشرات الحية ✔"),
                         backgroundColor: Color(0xFF10B981),
                         duration: Duration(seconds: 2),
                       ),
@@ -1008,7 +1249,7 @@ jobs:
           }
           EOF
 
-      - name: Generate main.dart (Sleek RTL Arabic FinTech UI with 3 Navigation Tabs)
+      - name: Generate main.dart (Sleek RTL Dashboard with Live Market Price & Indicator Bar)
         run: |
           cat << 'EOF' > lib/main.dart
           import 'package:flutter/material.dart';
@@ -1119,7 +1360,7 @@ jobs:
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text("QuMatix Pro AI", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text("نظام التداول الآلي المباشر", style: TextStyle(fontSize: 10.5, color: Colors.white60)),
+                          Text("محرك المؤشرات الحية والتداول الآلي", style: TextStyle(fontSize: 10.5, color: Colors.white60)),
                         ],
                       ),
                     ],
@@ -1283,7 +1524,34 @@ jobs:
                               ),
                             ],
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: 12),
+                          // شريط بيانات السعر الحي والمؤشرات المباشرة من السيرفر
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF0B0F19),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: Colors.white10),
+                            ),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  "السعر الحي: ${service.lastPrice > 0 ? service.lastPrice.toStringAsFixed(5) : 'بانتظار البث...'}",
+                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.cyanAccent),
+                                ),
+                                Text(
+                                  "الاتجاه: ${service.emaFast >= service.emaSlow ? 'صاعد ↗' : 'هابط ↘'} (${service.ticksCount} قراءة)",
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.bold,
+                                    color: service.emaFast >= service.emaSlow ? const Color(0xFF10B981) : const Color(0xFFEF4444),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 12),
                           SizedBox(
                             width: double.infinity,
                             child: ElevatedButton.icon(
@@ -1345,7 +1613,7 @@ jobs:
                         const SizedBox(width: 10),
                         Expanded(
                           child: _metricCard(
-                            title: "مؤشر RSI",
+                            title: "مؤشر RSI الحي",
                             value: service.currentRsi.toStringAsFixed(1),
                             icon: Icons.speed_rounded,
                             color: const Color(0xFFF59E0B),
@@ -1377,15 +1645,18 @@ jobs:
                                   ),
                                 ],
                               ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF1E293B),
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: Text(
-                                  service.lastSignal,
-                                  style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+                              Flexible(
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF1E293B),
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Text(
+                                    service.lastSignal,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+                                  ),
                                 ),
                               ),
                             ],
@@ -1403,7 +1674,7 @@ jobs:
                             items: const [
                               DropdownMenuItem(value: "qumatix_rsi_ema", child: Text("خوارزمية QuMatix الذكية (RSI + EMA)")),
                               DropdownMenuItem(value: "trend_momentum", child: Text("تتبع الزخم والاتجاه (Trend Pro)")),
-                              DropdownMenuItem(value: "reversal_sniper", child: Text("قناص الارتداد السعري (Reversal Sniper)")),
+                              DropdownMenuItem(value: "reversal_sniper", child: Text("قناص الارتداد السعري (Bollinger + RSI)")),
                             ],
                             onChanged: (val) {
                               setState(() => _selectedStrategy = val!);
@@ -1777,4 +2048,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: QuMatix-App-APK
-          path: build/app/outputs/flutter-apk/app-release.apk    
+          path: build/app/outputs/flutter-apk/app-release.apk
