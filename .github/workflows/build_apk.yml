@@ -1,4 +1,4 @@
-name: Build QuMatix APK
+name: Build Hussam AI APK
 
 on:
   push:
@@ -34,26 +34,13 @@ jobs:
           fi
           rm -rf test
 
-      - name: Generate Local Deep AI Neural Tensor Bank (~28.5 MB for 50 MB Total APK)
-        run: |
-          mkdir -p assets/ai_models
-          python3 - << 'PYEOF'
-          import os
-          import pathlib
-
-          out_file = pathlib.Path("assets/ai_models/qumatix_deep_neural_weights.bin")
-          target_bytes = 28 * 1024 * 1024 + 512 * 1024
-          out_file.write_bytes(os.urandom(target_bytes))
-          print("Generated AI Neural Tensor Bank:", out_file.stat().st_size, "bytes")
-          PYEOF
-
       - name: Generate pubspec.yaml
         run: |
           cat << 'EOF' > pubspec.yaml
           name: qumatix_bot
-          description: "QuMatix Pro AI v9.0 - Exact 1-Minute Synchronized Liquidity Radar & Deep AI"
+          description: "Hussam AI - Liquidity Radar, Technical Indicators Engine and Gemini Analysis"
           publish_to: 'none'
-          version: 9.5.0+13
+          version: 9.6.0+14
 
           environment:
             sdk: '>=3.0.0 <4.0.0'
@@ -64,6 +51,7 @@ jobs:
             provider: ^6.1.2
             flutter_inappwebview: ^6.1.5
             shared_preferences: ^2.2.3
+            path_provider: ^2.1.3
             cupertino_icons: ^1.0.6
 
           dev_dependencies:
@@ -73,8 +61,6 @@ jobs:
 
           flutter:
             uses-material-design: true
-            assets:
-              - assets/ai_models/qumatix_deep_neural_weights.bin
           EOF
 
       - name: Write Full AndroidManifest.xml with Internet Permissions
@@ -87,7 +73,7 @@ jobs:
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
               <application
-                  android:label="QuMatix Pro AI"
+                  android:label="Hussam AI"
                   android:name="${applicationName}"
                   android:icon="@mipmap/ic_launcher"
                   android:usesCleartextTraffic="true">
@@ -115,7 +101,7 @@ jobs:
           </manifest>
           EOF
 
-      - name: Generate quotex_service.dart (1-Minute Synchronized Server Liquidity Radar + 5-Model Deep AI)
+      - name: Generate quotex_service.dart (Liquidity Radar + Indicators Engine + Trained Model + Gemini)
         run: |
           mkdir -p lib/services
           cat << 'EOF' > lib/services/quotex_service.dart
@@ -126,6 +112,8 @@ jobs:
           import 'package:flutter/foundation.dart';
           import 'package:flutter/services.dart';
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:path_provider/path_provider.dart';
 
           class _AiPatternSample {
             final List<double> features;
@@ -152,6 +140,180 @@ jobs:
             double get lowerWick => min(open, close) - low;
           }
 
+          class _TrainedModel {
+            final List<double> mean, std, w;
+            final double b;
+            final List<int> lags;
+            final double valAcc;
+            final int horizon;
+            _TrainedModel(this.mean, this.std, this.w, this.b, this.lags, this.valAcc, this.horizon);
+
+            static _TrainedModel? fromJson(String raw) {
+              try {
+                final m = jsonDecode(raw);
+                if (m is! Map || m['ok'] != true) return null;
+                List<double> d(String k) => (m[k] as List).map((e) => (e as num).toDouble()).toList();
+                return _TrainedModel(d('mean'), d('std'), d('w'), (m['b'] as num).toDouble(),
+                    (m['lags'] as List).map((e) => (e as num).toInt()).toList(),
+                    (m['val_acc'] as num).toDouble(), (m['horizon'] as num).toInt());
+              } catch (_) {
+                return null;
+              }
+            }
+
+            static double _avg(List<double> x) => x.reduce((a, b) => a + b) / x.length;
+            static double _sd(List<double> x) {
+              final m = _avg(x);
+              return sqrt(x.map((e) => (e - m) * (e - m)).reduce((a, b) => a + b) / x.length);
+            }
+
+            // الميزات مبنية على آخر 40 تيك (كل تغيّر سعر = تيك) وليس على ثواني ثابتة
+            static List<double>? features(List<double> w40, List<int> lags) {
+              if (w40.length != 40) return null;
+              final last = w40.last;
+              if (last <= 0) return null;
+              final diffs = <double>[for (int i = 1; i < 40; i++) w40[i] - w40[i - 1]];
+              final eps = last * 1e-7;
+              final s = max(_sd(diffs), eps);
+              final f = <double>[];
+              for (final k in lags) {
+                f.add((last - w40[39 - k]) / (s * sqrt(k.toDouble())));
+              }
+              final w20 = w40.sublist(20);
+              f.add((last - _avg(w20)) / max(_sd(w20), eps));
+              double g = 0.0, l = 0.0;
+              for (final d in diffs.sublist(diffs.length - 14)) {
+                if (d > 0) {
+                  g += d;
+                } else {
+                  l -= d;
+                }
+              }
+              f.add((g + l) == 0 ? 0.0 : (100.0 * g / (g + l) - 50.0) / 50.0);
+              f.add((_avg(w40.sublist(35)) - _avg(w40.sublist(27))) / (s * sqrt(5.0)));
+              f.add(_sd(diffs.sublist(diffs.length - 10)) / s);
+              return [for (final v in f) v.clamp(-5.0, 5.0).toDouble()];
+            }
+
+            double? predict(List<double> p, int tradeSec) {
+              if (tradeSec != horizon || p.length < 40) return null;
+              final f = features(p.sublist(p.length - 40), lags);
+              if (f == null || f.length != w.length) return null;
+              double z = b;
+              for (int i = 0; i < f.length; i++) {
+                z += ((f[i] - mean[i]) / std[i]) * w[i];
+              }
+              return 1.0 / (1.0 + exp(-z));
+            }
+          }
+
+          String _trainOtcModelSync(Map<String, dynamic> a) {
+            final int horizonSec = a['horizon'] as int;
+            final double horizonMs = horizonSec * 1000.0;
+            const lags = [1, 2, 3, 5, 8, 13, 21, 34];
+            final ts = <String, List<double>>{};
+            final px = <String, List<double>>{};
+            for (final path in (a['paths'] as List)) {
+              final file = File(path as String);
+              if (!file.existsSync()) continue;
+              for (final line in file.readAsLinesSync()) {
+                final p = line.split(',');
+                if (p.length != 3) continue;
+                final t = double.tryParse(p[1]);
+                final v = double.tryParse(p[2]);
+                if (t == null || v == null || v <= 0) continue;
+                (ts[p[0]] ??= <double>[]).add(t);
+                (px[p[0]] ??= <double>[]).add(v);
+              }
+            }
+            final trX = <List<double>>[], teX = <List<double>>[];
+            final trY = <double>[], teY = <double>[];
+            for (final sym in ts.keys) {
+              final t = ts[sym]!;
+              final p = px[sym]!;
+              if (p.length < 300) continue;
+              final X = <List<double>>[];
+              final y = <double>[];
+              int j = 0;
+              for (int i = 39; i < p.length - 1; i += 3) {
+                if (j < i) j = i;
+                while (j < p.length && t[j] < t[i] + horizonMs) {
+                  j++;
+                }
+                if (j >= p.length) break;
+                if (p[j] == p[i]) continue;
+                if (t[j] > t[i] + horizonMs * 1.5) continue;
+                if (t[i] - t[i - 39] > 600000) continue;
+                final f = _TrainedModel.features(p.sublist(i - 39, i + 1), lags);
+                if (f == null) continue;
+                X.add(f);
+                y.add(p[j] > p[i] ? 1.0 : 0.0);
+              }
+              if (y.length < 150) continue;
+              final n = (y.length * 0.7).floor();
+              trX.addAll(X.sublist(0, n));
+              trY.addAll(y.sublist(0, n));
+              teX.addAll(X.sublist(n));
+              teY.addAll(y.sublist(n));
+            }
+            if (trY.length < 500 || teY.length < 200) {
+              return jsonEncode({'ok': false, 'reason': 'تم جمع ${trY.length + teY.length} عينة فقط'});
+            }
+            final nf = trX.first.length;
+            final mu = List<double>.filled(nf, 0.0);
+            final sg = List<double>.filled(nf, 0.0);
+            for (final r in trX) {
+              for (int k = 0; k < nf; k++) {
+                mu[k] += r[k];
+              }
+            }
+            for (int k = 0; k < nf; k++) {
+              mu[k] /= trX.length;
+            }
+            for (final r in trX) {
+              for (int k = 0; k < nf; k++) {
+                sg[k] += (r[k] - mu[k]) * (r[k] - mu[k]);
+              }
+            }
+            for (int k = 0; k < nf; k++) {
+              sg[k] = sqrt(sg[k] / trX.length) + 1e-9;
+            }
+            final Z = [for (final r in trX) [for (int k = 0; k < nf; k++) (r[k] - mu[k]) / sg[k]]];
+            final w = List<double>.filled(nf, 0.0);
+            double b = 0.0;
+            for (int ep = 0; ep < 300; ep++) {
+              final gw = List<double>.filled(nf, 0.0);
+              double gb = 0.0;
+              for (int i = 0; i < Z.length; i++) {
+                double z = b;
+                for (int k = 0; k < nf; k++) {
+                  z += Z[i][k] * w[k];
+                }
+                final e = 1.0 / (1.0 + exp(-z)) - trY[i];
+                for (int k = 0; k < nf; k++) {
+                  gw[k] += e * Z[i][k];
+                }
+                gb += e;
+              }
+              for (int k = 0; k < nf; k++) {
+                w[k] -= 0.2 * (gw[k] / Z.length + 1e-3 * w[k]);
+              }
+              b -= 0.2 * gb / Z.length;
+            }
+            int hit = 0;
+            for (int i = 0; i < teX.length; i++) {
+              double z = b;
+              for (int k = 0; k < nf; k++) {
+                z += ((teX[i][k] - mu[k]) / sg[k]) * w[k];
+              }
+              if ((z > 0) == (teY[i] > 0.5)) hit++;
+            }
+            return jsonEncode({
+              'ok': true, 'mean': mu, 'std': sg, 'w': w, 'b': b, 'lags': lags, 'horizon': horizonSec,
+              'val_acc': hit / teX.length, 'n_train': trY.length, 'n_test': teY.length,
+            });
+          }
+
           class QuotexService extends ChangeNotifier {
             WebSocket? _directSocket;
             InAppWebViewController? _webViewController;
@@ -165,6 +327,25 @@ jobs:
             bool _isAutoTrading = false;
             bool _isTradeOpen = false;
             bool _aiTensorLoaded = false;
+            _TrainedModel? _model;
+            double? _modelProb;
+            static const String _defaultGeminiKey = String.fromEnvironment('GEMINI_API_KEY', defaultValue: 'AQ.Ab8RN6L04To4_9jkRYxmpP8DVg-4m93GRMqVU55Wqw4yTqWE8Q');
+            String _geminiKey = _defaultGeminiKey;
+            bool _collectEnabled = false;
+            bool _training = false;
+            String _modelInfo = 'لم يُدرَّب بعد';
+            int _dataBytes = 0;
+            int _collectCursor = 0;
+            bool _flushing = false;
+            Directory? _dataDir;
+            final Set<String> _seenOtc = {};
+            final StringBuffer _tickBuf = StringBuffer();
+            String _geminiModel = 'gemini-2.5-flash';
+            bool _geminiGate = false;
+            bool _geminiBusy = false;
+            String _geminiDir = '';
+            int _geminiConf = 0;
+            String _geminiReason = '';
 
             double _balance = 0.0;
             double _initialSessionBalance = 0.0;
@@ -251,25 +432,286 @@ jobs:
             int _remainingSeconds = 0;
 
             QuotexService() {
-              _initLocalAiTensorBank();
+              _initModelAndPrefs();
+            }
+            static const List<String> otcPairs = [
+              "EUR/USD (OTC)",
+              "GBP/USD (OTC)",
+              "USD/JPY (OTC)",
+              "AUD/CAD (OTC)",
+              "AUD/CHF (OTC)",
+              "AUD/JPY (OTC)",
+              "AUD/NZD (OTC)",
+              "AUD/USD (OTC)",
+              "CAD/CHF (OTC)",
+              "CAD/JPY (OTC)",
+              "CHF/JPY (OTC)",
+              "EUR/AUD (OTC)",
+              "EUR/CAD (OTC)",
+              "EUR/CHF (OTC)",
+              "EUR/GBP (OTC)",
+              "EUR/JPY (OTC)",
+              "EUR/NZD (OTC)",
+              "GBP/AUD (OTC)",
+              "GBP/CAD (OTC)",
+              "GBP/CHF (OTC)",
+              "GBP/JPY (OTC)",
+              "GBP/NZD (OTC)",
+              "NZD/CAD (OTC)",
+              "NZD/CHF (OTC)",
+              "NZD/JPY (OTC)",
+              "NZD/USD (OTC)",
+              "USD/CAD (OTC)",
+              "USD/CHF (OTC)",
+              "USD/BRL (OTC)",
+              "USD/EGP (OTC)",
+              "USD/TRY (OTC)",
+              "USD/INR (OTC)",
+              "USD/PKR (OTC)",
+              "USD/BDT (OTC)",
+              "USD/ARS (OTC)",
+              "USD/MXN (OTC)",
+              "USD/NGN (OTC)",
+              "USD/PHP (OTC)",
+              "USD/IDR (OTC)",
+              "USD/COP (OTC)",
+              "USD/DZD (OTC)",
+              "Gold (OTC)",
+              "Silver (OTC)",
+              "UKBrent (OTC)",
+              "USCrude (OTC)",
+              "Bitcoin (OTC)",
+              "Ethereum (OTC)"
+            ];
+
+            Future<Directory?> _ensureDir() async {
+              if (_dataDir != null) return _dataDir;
+              try {
+                _dataDir = await getApplicationDocumentsDirectory();
+              } catch (_) {}
+              return _dataDir;
             }
 
-            Future<void> _initLocalAiTensorBank() async {
+            bool get collectEnabled => _collectEnabled;
+            bool get training => _training;
+            String get modelInfo => _modelInfo;
+            double get dataMegabytes => _dataBytes / 1048576.0;
+            int get collectedPairs => _seenOtc.length;
+            bool get modelActive => _model != null;
+
+            Future<void> _initModelAndPrefs() async {
               try {
-                final data = await rootBundle.load('assets/ai_models/qumatix_deep_neural_weights.bin');
-                if (data.lengthInBytes > 1024) {
-                  final bytes = data.buffer.asUint8List(0, 64);
-                  for (int i = 0; i < _deepNeuralWeights.length; i++) {
-                    final double delta = ((bytes[i] / 255.0) - 0.5) * 0.04;
-                    _deepNeuralWeights[i] = (_deepNeuralWeights[i] + delta).clamp(0.10, 0.45);
+                final p = await SharedPreferences.getInstance();
+                final k = p.getString('gemini_key');
+                if (k != null && k.isNotEmpty) _geminiKey = k;
+                _geminiModel = p.getString('gemini_model') ?? _geminiModel;
+                _geminiGate = p.getBool('gemini_gate') ?? false;
+                _collectEnabled = p.getBool('collect_otc') ?? false;
+              } catch (_) {}
+              try {
+                final dir = await _ensureDir();
+                if (dir != null) {
+                  final f = File('${dir.path}/otc_model.json');
+                  if (await f.exists()) {
+                    final m = _TrainedModel.fromJson(await f.readAsString());
+                    if (m != null && m.valAcc >= 0.52) {
+                      _model = m;
+                      _aiTensorLoaded = true;
+                      _modelInfo = 'نموذج محفوظ: دقة الاختبار ${(m.valAcc * 100).toStringAsFixed(1)}% (أفق ${m.horizon}ث)';
+                      addLog("تم تحميل النموذج المدرَّب على أسعار OTC. $_modelInfo");
+                    }
                   }
-                  _aiTensorLoaded = true;
-                  addLog("🧠 تم تحميل مصفوفة الذكاء الاصطناعي العميق (28.5 MB) ورادار سيولة الدقيقة الواحدة ✔");
+                  int bytes = 0;
+                  for (final n in ['otc_ticks.csv', 'otc_ticks_old.csv']) {
+                    final x = File('${dir.path}/$n');
+                    if (await x.exists()) bytes += await x.length();
+                  }
+                  _dataBytes = bytes;
                 }
               } catch (_) {}
+              notifyListeners();
             }
 
-            bool get isConnected => _isConnected;
+            Future<void> setCollect(bool v) async {
+              _collectEnabled = v;
+              try {
+                final p = await SharedPreferences.getInstance();
+                await p.setBool('collect_otc', v);
+              } catch (_) {}
+              addLog(v ? "بدأ جمع أسعار OTC من سيرفر Quotex (يدور على الأزواج أثناء عدم وجود صفقات)" : "توقف جمع الأسعار");
+            }
+
+            void _cycleCollector() {
+              if (_webViewController == null || !_isConnected) return;
+              final sym = toServerSymbol(otcPairs[_collectCursor % otcPairs.length]);
+              _collectCursor++;
+              _webViewController!.evaluateJavascript(source: '''
+                (function() {
+                  try {
+                    if (window.__qm_sockets) {
+                      for (let i = 0; i < window.__qm_sockets.length; i++) {
+                        const ws = window.__qm_sockets[i];
+                        if (ws && ws.readyState === 1) {
+                          ws.send('42["instruments/update",{"asset":"$sym","period":$_tradeDuration}]');
+                        }
+                      }
+                    }
+                  } catch(e) {}
+                })();
+              ''');
+            }
+
+            void _ingestTicks(List raw) {
+              if (!_collectEnabled) return;
+              for (final t in raw) {
+                if (t is List && t.length == 3 && t[0] is String && t[1] is num && t[2] is num) {
+                  final sym = t[0] as String;
+                  if (sym.contains(',') || sym.contains('\n')) continue;
+                  _seenOtc.add(sym);
+                  _tickBuf.write('$sym,${(t[1] as num).toInt()},${t[2]}\n');
+                }
+              }
+              _flushTicks();
+            }
+
+            Future<void> _flushTicks() async {
+              if (_flushing || _tickBuf.isEmpty) return;
+              _flushing = true;
+              try {
+                final dir = await _ensureDir();
+                if (dir == null) return;
+                final text = _tickBuf.toString();
+                _tickBuf.clear();
+                final f = File('${dir.path}/otc_ticks.csv');
+                if (await f.exists() && await f.length() > 24 * 1024 * 1024) {
+                  final old = File('${dir.path}/otc_ticks_old.csv');
+                  if (await old.exists()) await old.delete();
+                  await f.rename(old.path);
+                }
+                await File('${dir.path}/otc_ticks.csv').writeAsString(text, mode: FileMode.append);
+                _dataBytes += text.length;
+              } catch (_) {
+              } finally {
+                _flushing = false;
+              }
+            }
+
+            Future<void> trainModelNow() async {
+              if (_training) return;
+              _training = true;
+              notifyListeners();
+              try {
+                await _flushTicks();
+                final dir = await _ensureDir();
+                if (dir == null) throw 'تعذر الوصول لمجلد التطبيق';
+                final out = await compute(_trainOtcModelSync, <String, dynamic>{
+                  'paths': ['${dir.path}/otc_ticks_old.csv', '${dir.path}/otc_ticks.csv'],
+                  'horizon': _tradeDuration,
+                });
+                final j = jsonDecode(out);
+                if (j is Map && j['ok'] == true) {
+                  final acc = (j['val_acc'] as num).toDouble();
+                  final nTest = (j['n_test'] as num).toInt();
+                  _modelInfo = 'دقة الاختبار ${(acc * 100).toStringAsFixed(1)}% على $nTest عينة (${j['n_train']} للتدريب، أفق ${j['horizon']}ث)';
+                  if (acc >= 0.52 && nTest >= 500) {
+                    await File('${dir.path}/otc_model.json').writeAsString(out);
+                    _model = _TrainedModel.fromJson(out);
+                    _aiTensorLoaded = _model != null;
+                    addLog("تم تدريب النموذج على أسعار OTC وتفعيله: $_modelInfo");
+                  } else {
+                    addLog("اكتمل التدريب لكن النموذج لا يتفوق على الصدفة فلم يُفعَّل: $_modelInfo");
+                  }
+                } else {
+                  _modelInfo = 'البيانات غير كافية بعد: ${j['reason'] ?? ''}';
+                  addLog("التدريب: $_modelInfo");
+                }
+              } catch (e) {
+                _modelInfo = 'فشل التدريب';
+                addLog("التدريب: فشل ($e)");
+              } finally {
+                _training = false;
+                notifyListeners();
+              }
+            }
+
+              Future<void> setGemini({String? key, String? model, bool? gate}) async {
+                if (key != null) _geminiKey = key;
+                if (model != null && model.isNotEmpty) _geminiModel = model;
+                if (gate != null) _geminiGate = gate;
+                try {
+                  final p = await SharedPreferences.getInstance();
+                  await p.setString('gemini_key', _geminiKey);
+                  await p.setString('gemini_model', _geminiModel);
+                  await p.setBool('gemini_gate', _geminiGate);
+                } catch (_) {}
+                notifyListeners();
+              }
+
+              bool get hasGeminiKey => _geminiKey.isNotEmpty;
+              bool get geminiBusy => _geminiBusy;
+              String get geminiDir => _geminiDir;
+              int get geminiConf => _geminiConf;
+              String get geminiReason => _geminiReason;
+              bool get geminiGate => _geminiGate;
+              String get geminiModel => _geminiModel;
+
+              Future<void> askGemini() async {
+                if (_geminiKey.isEmpty || _geminiBusy) return;
+                _geminiBusy = true;
+                notifyListeners();
+                final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+                try {
+                  final recent = _priceHistory.length > 30 ? _priceHistory.sublist(_priceHistory.length - 30) : _priceHistory;
+                  final prompt = 'You are a cautious market analyst for a 1-minute binary option. Use ONLY the data below. '
+                      'Reply with strict JSON: {"direction":"CALL|PUT|WAIT","confidence":0-100,"reason":"one short Arabic sentence"}. '
+                      'Answer WAIT when the data is unclear. Data: asset=$activeAsset, lastPrice=$_lastPrice, '
+                      'ema5=${_ema5.toStringAsFixed(6)}, ema13=${_ema13.toStringAsFixed(6)}, rsi14=${_currentRsi.toStringAsFixed(1)}, '
+                      'macdHist=${_macdHistogram.toStringAsFixed(6)}, stochK=${_stochasticK.toStringAsFixed(1)}, cci=${_cci14.toStringAsFixed(1)}, '
+                      'momentum=${_priceMomentum.toStringAsFixed(6)}, crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, '
+                      'trainedModelProbUp=${_modelProb?.toStringAsFixed(3) ?? "n/a"}, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
+                      'last30Prices=${recent.join(",")}';
+                  final req = await client.postUrl(Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$_geminiModel:generateContent'));
+                  req.headers.set('Content-Type', 'application/json');
+                  req.headers.set('x-goog-api-key', _geminiKey);
+                  req.add(utf8.encode(jsonEncode({
+                    'contents': [
+                      {'parts': [{'text': prompt}]}
+                    ],
+                    'generationConfig': {'temperature': 0.2, 'responseMimeType': 'application/json'},
+                  })));
+                  final res = await req.close().timeout(const Duration(seconds: 20));
+                  final body = await res.transform(utf8.decoder).join();
+                  if (res.statusCode != 200) {
+                    addLog("Gemini: رفض الطلب (رمز ${res.statusCode}) تحقق من المفتاح واسم النموذج");
+                    _geminiDir = '';
+                  } else {
+                    final j = jsonDecode(body);
+                    final text = j['candidates'][0]['content']['parts'][0]['text'] as String;
+                    final m = jsonDecode(text.replaceAll(RegExp(r'```json|```'), '').trim());
+                    final d = (m['direction'] ?? '').toString().toUpperCase();
+                    _geminiDir = (d == 'CALL' || d == 'PUT') ? d : 'WAIT';
+                    _geminiConf = ((m['confidence'] as num?) ?? 0).round().clamp(0, 100);
+                    _geminiReason = (m['reason'] ?? '').toString();
+                  }
+                } catch (_) {
+                  addLog("Gemini: تعذر الاتصال أو قراءة الرد");
+                  _geminiDir = '';
+                } finally {
+                  client.close();
+                  _geminiBusy = false;
+                  notifyListeners();
+                }
+              }
+
+              Future<bool> _geminiApproves(String dir) async {
+                if (!_geminiGate || _geminiKey.isEmpty) return true;
+                await askGemini();
+                final ok = _geminiDir == dir.toUpperCase() && _geminiConf >= 60;
+                addLog(ok
+                    ? "Gemini وافق على ${dir.toUpperCase()} ($_geminiConf%)"
+                    : "Gemini لم يوافق (${_geminiDir.isEmpty ? 'لا رد' : _geminiDir} $_geminiConf%) وتم تخطي هذه الدقيقة");
+                return ok;
+              }            bool get isConnected => _isConnected;
             bool get isAuthenticated => _isAuthenticated;
             bool get isAutoTrading => _isAutoTrading;
             bool get isTradeOpen => _isTradeOpen;
@@ -426,8 +868,8 @@ jobs:
                 return;
               }
 
-              String stratName = "Deep AI 🧠";
-              if (_strategy == "qumatix_rsi_ema") stratName = "QuMatix";
+              String stratName = "محرك المؤشرات 📊";
+              if (_strategy == "qumatix_rsi_ema") stratName = "RSI + EMA";
               if (_strategy == "trend_momentum") stratName = "Trend Pro";
               if (_strategy == "reversal_sniper") stratName = "Sniper";
 
@@ -522,7 +964,10 @@ jobs:
               _webSyncTimer = Timer.periodic(const Duration(milliseconds: 800), (_) async {
                 if (!_isConnected || _webViewController == null) return;
                 tickCounter++;
-                if (tickCounter % 6 == 0) {
+                final bool cycling = _collectEnabled && !_isAutoTrading && !_isTradeOpen;
+                if (cycling) {
+                  if (tickCounter % 19 == 0) _cycleCollector();
+                } else if (tickCounter % 6 == 0) {
                   _subscribeServerToAsset(activeAsset);
                 }
 
@@ -622,7 +1067,8 @@ jobs:
                           chartPair: chartPair,
                           prices: prices.slice(-100),
                           minCall: Math.round(minCall),
-                          minPut: Math.round(minPut)
+                          minPut: Math.round(minPut),
+                          ticks: (window.__qm_tick_buf ? window.__qm_tick_buf.splice(0, window.__qm_tick_buf.length) : [])
                         });
                       } catch(e) { return '{}'; }
                     })();
@@ -648,6 +1094,9 @@ jobs:
                       if (map['minPut'] is num) {
                         _crowdPutVolume = (map['minPut'] as num).toDouble();
                       }
+
+                      final rawTicks = map['ticks'];
+                      if (rawTicks is List && rawTicks.isNotEmpty) _ingestTicks(rawTicks);
 
                       final rawPrices = map['prices'];
                       if (rawPrices is List && rawPrices.isNotEmpty) {
@@ -709,6 +1158,7 @@ jobs:
                 final String contrarianDir = (_crowdCallVolume > _crowdPutVolume) ? "put" : "call";
                 addLog("💰 [رادار الدقيقة ${_currentSecondInMinute}s] دخول الناس CALL: \$${_crowdCallVolume.toStringAsFixed(0)} ضد PUT: \$${_crowdPutVolume.toStringAsFixed(0)} (الفارق: \$${diff.toStringAsFixed(0)} >= \$${_requiredVolumeDiff.toStringAsFixed(0)}) => تنفيذ ${contrarianDir.toUpperCase()} مع مصلحة المنصة!");
 
+                if (!await _geminiApproves(contrarianDir)) return;
                 await placeOrder(
                   asset: activeAsset,
                   direction: contrarianDir,
@@ -718,14 +1168,15 @@ jobs:
                 return;
               }
 
-              // استراتيجيات الذكاء الاصطناعي العميق والمؤشرات
+              // استراتيجيات محرك المؤشرات
               if (_priceHistory.length < 4) return;
               if (_currentSignalStrength < _minSignalStrength) return;
 
               _lastTradedMinuteBucket = currentMinBucket;
               final String direction = _currentSignalDirection.toLowerCase();
-              addLog("🧠 إشارة ذكاء اصطناعي فائقة القوة: $_currentSignalStrength% (المطلوب: $_minSignalStrength%+) => تنفيذ $_currentSignalDirection عبر السيرفر");
+              addLog("🧠 إشارة محرك المؤشرات: $_currentSignalStrength% (المطلوب: $_minSignalStrength%+) => تنفيذ $_currentSignalDirection عبر السيرفر");
 
+              if (!await _geminiApproves(direction)) return;
               await placeOrder(
                 asset: activeAsset,
                 direction: direction,
@@ -911,6 +1362,8 @@ jobs:
                 weightedSum += x[i] * _deepNeuralWeights[i];
               }
               _mlpScore = _sigmoid((n4 * 1.6) + (weightedSum * 1.4));
+              _modelProb = _model?.predict(_priceHistory, _tradeDuration);
+              if (_modelProb != null) _mlpScore = _modelProb!;
 
               int rfCallTrees = 0;
               if (_ema5 > _ema13 && _ema13 > _ema26) rfCallTrees += 2;
@@ -1042,7 +1495,7 @@ jobs:
               } else if (_strategy == "hybrid_ai_contrarian") {
                 addLog("🔥 بدأ المحرك المدمج (رادار الدقيقة الواحدة بفارق \$${_requiredVolumeDiff.toStringAsFixed(0)}+ مع الذكاء الاصطناعي بقوة $_minSignalStrength%+)");
               } else {
-                addLog("🧠 بدأ الذكاء الاصطناعي الخماسي تحليل ($activeAsset) | شرط الدخول: قوة إشارة $_minSignalStrength%+");
+                addLog("🧠 بدأ محرك المؤشرات الخماسي تحليل ($activeAsset) | شرط الدخول: قوة إشارة $_minSignalStrength%+");
               }
               notifyListeners();
             }
@@ -1324,6 +1777,18 @@ jobs:
                 window.__qm_min_put_by_key = {};
                 window.__qm_last_price_by_key = {};
                 window.__qm_avg_step_by_key = {};
+                window.__qm_tick_buf = [];
+                window.__qm_last_otc = {};
+
+                function logTick(asset, ts, price) {
+                  try {
+                    const a = String(asset);
+                    if (a.toLowerCase().indexOf('_otc') === -1) return;
+                    if (window.__qm_last_otc[a] === price) return;
+                    window.__qm_last_otc[a] = price;
+                    if (window.__qm_tick_buf.length < 6000) window.__qm_tick_buf.push([a, Math.round(ts * 1000), price]);
+                  } catch (e) {}
+                }
 
                 function normKey(s) {
                   return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
@@ -1390,6 +1855,7 @@ jobs:
                     // صيغة البث الحي المباشر من السيرفر: ["EURUSD_otc", 1728918015.2, 1.08542, 0]
                     if (node.length >= 3 && typeof node[0] === 'string' && typeof node[1] === 'number' && typeof node[2] === 'number') {
                       if (node[1] > 1500000000 && node[2] > 0) {
+                        logTick(node[0], node[1], node[2]);
                         recordLiveStreamTick(node[0], node[2], false);
                         return;
                       }
@@ -1833,41 +2299,47 @@ jobs:
             );
           }
 
+          class C {
+            static const bg = Color(0xFF0A0E17);
+            static const card = Color(0xFF111827);
+            static const field = Color(0xFF0B1220);
+            static const line = Color(0xFF1E293B);
+            static const green = Color(0xFF10B981);
+            static const red = Color(0xFFEF4444);
+            static const blue = Color(0xFF3B82F6);
+            static const amber = Color(0xFFF59E0B);
+            static const dim = Color(0xFF94A3B8);
+          }
+
           class QuMatixApp extends StatelessWidget {
             const QuMatixApp({super.key});
 
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'QuMatix Pro AI',
+                title: 'Hussam AI',
                 debugShowCheckedModeBanner: false,
-                theme: ThemeData.dark().copyWith(
-                  scaffoldBackgroundColor: const Color(0xFF0B0F19),
-                  cardColor: const Color(0xFF111827),
+                theme: ThemeData.dark(useMaterial3: true).copyWith(
+                  scaffoldBackgroundColor: C.bg,
                   colorScheme: const ColorScheme.dark(
-                    primary: Color(0xFF10B981),
-                    onPrimary: Colors.white,
-                    secondary: Color(0xFF3B82F6),
-                    onSecondary: Colors.white,
-                    surface: Color(0xFF111827),
+                    primary: C.green,
+                    secondary: C.blue,
+                    surface: C.card,
                   ),
-                  elevatedButtonTheme: ElevatedButtonThemeData(
-                    style: ElevatedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                    ),
+                  appBarTheme: const AppBarTheme(backgroundColor: C.bg, elevation: 0, scrolledUnderElevation: 0),
+                  navigationBarTheme: NavigationBarThemeData(
+                    backgroundColor: C.card,
+                    indicatorColor: C.green.withOpacity(0.18),
+                    labelTextStyle: const WidgetStatePropertyAll(TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
                   ),
                 ),
-                builder: (context, child) {
-                  return Directionality(
-                    textDirection: TextDirection.rtl,
-                    child: child!,
-                  );
-                },
+                builder: (context, child) => Directionality(textDirection: TextDirection.rtl, child: child!),
                 home: const MainWorkspace(),
               );
             }
           }
 
+          // ───────────────────────── الهيكل الرئيسي (لا يستمع للخدمة = لا يعلّق) ─────────────────────────
           class MainWorkspace extends StatefulWidget {
             const MainWorkspace({super.key});
 
@@ -1876,963 +2348,666 @@ jobs:
           }
 
           class _MainWorkspaceState extends State<MainWorkspace> {
-            int _currentTab = 0;
+            int _tab = 0;
 
-            final TextEditingController _amountController = TextEditingController(text: "1");
-            final TextEditingController _tpController = TextEditingController(text: "50");
-            final TextEditingController _slController = TextEditingController(text: "25");
-            final TextEditingController _diffController = TextEditingController(text: "250");
-
-            String _selectedAsset = "AUTO_CHART";
-            String _selectedStrategy = "platform_interest_contrarian";
-            int _selectedDuration = 60;
-            int _selectedMinStrength = 80;
-            bool _enterAtMinuteEndOnly = true;
-            bool _isRealAccount = false;
-            bool _useMartingale = true;
-
-            void _syncSettings(QuotexService service) {
-              service.updateSettings(
-                asset: _selectedAsset,
-                duration: _selectedDuration,
-                baseAmount: double.tryParse(_amountController.text) ?? 1.0,
-                useMartingale: _useMartingale,
-                takeProfit: double.tryParse(_tpController.text) ?? 50.0,
-                stopLoss: double.tryParse(_slController.text) ?? 25.0,
-                strategy: _selectedStrategy,
-                isRealAccount: _isRealAccount,
-                minSignalStrength: _selectedMinStrength,
-                requiredVolumeDiff: double.tryParse(_diffController.text) ?? 250.0,
-                enterAtMinuteEndOnly: _enterAtMinuteEndOnly,
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  titleSpacing: 16,
+                  title: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(colors: [C.green, Color(0xFF059669)]),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(Icons.bolt_rounded, color: Colors.white, size: 20),
+                      ),
+                      const SizedBox(width: 10),
+                      const Text('Hussam AI', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
+                    ],
+                  ),
+                  actions: const [_ConnectionChip(), SizedBox(width: 14)],
+                ),
+                body: IndexedStack(
+                  index: _tab,
+                  children: [
+                    const DashboardTab(),
+                    QuotexPlatformView(onConnectedSuccess: () => setState(() => _tab = 0)),
+                    const SettingsTab(),
+                    const LogsTab(),
+                  ],
+                ),
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: _tab,
+                  height: 66,
+                  onDestinationSelected: (i) => setState(() => _tab = i),
+                  destinations: const [
+                    NavigationDestination(icon: Icon(Icons.dashboard_rounded), label: 'الرئيسية'),
+                    NavigationDestination(icon: Icon(Icons.candlestick_chart_rounded), label: 'المنصة'),
+                    NavigationDestination(icon: Icon(Icons.tune_rounded), label: 'الإعدادات'),
+                    NavigationDestination(icon: Icon(Icons.terminal_rounded), label: 'السجل'),
+                  ],
+                ),
               );
+            }
+          }
+
+          // ───────────────────────── مكونات مشتركة ─────────────────────────
+          class Panel extends StatelessWidget {
+            final Widget child;
+            const Panel({super.key, required this.child});
+
+            @override
+            Widget build(BuildContext context) {
+              return Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: C.card,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: C.line),
+                ),
+                child: child,
+              );
+            }
+          }
+
+          class _Tag extends StatelessWidget {
+            final String text;
+            final Color color;
+            const _Tag(this.text, this.color);
+
+            @override
+            Widget build(BuildContext context) {
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.14),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(text, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w700)),
+              );
+            }
+          }
+
+          class _ConnectionChip extends StatelessWidget {
+            const _ConnectionChip();
+
+            @override
+            Widget build(BuildContext context) {
+              final on = context.select<QuotexService, bool>((s) => s.isConnected);
+              return _Tag(on ? '● متصل' : '● غير متصل', on ? C.green : C.red);
+            }
+          }
+
+          // ───────────────────────── الرئيسية ─────────────────────────
+          class DashboardTab extends StatelessWidget {
+            const DashboardTab({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return ListView(
+                padding: const EdgeInsets.fromLTRB(14, 6, 14, 20),
+                physics: const ClampingScrollPhysics(),
+                children: const [
+                  RepaintBoundary(child: _BalanceCard()),
+                  SizedBox(height: 12),
+                  RepaintBoundary(child: _RadarCard()),
+                  SizedBox(height: 12),
+                  RepaintBoundary(child: _SignalStatsCard()),
+                  SizedBox(height: 12),
+                  RepaintBoundary(child: _GeminiCard()),
+                  SizedBox(height: 12),
+                  _BotButton(),
+                  SizedBox(height: 12),
+                  _ManualTrade(),
+                ],
+              );
+            }
+          }
+
+          class _BalanceCard extends StatelessWidget {
+            const _BalanceCard();
+
+            @override
+            Widget build(BuildContext context) {
+              final r = context.select<QuotexService, (String, double, String, String)>(
+                (s) => (s.balanceText, s.netProfit, s.accountType, s.activeAsset),
+              );
+              final up = r.$2 >= 0;
+              final col = up ? C.green : C.red;
+              return Panel(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        _Tag(r.$3 == 'real' ? 'حساب حقيقي' : 'حساب تجريبي', r.$3 == 'real' ? C.amber : C.blue),
+                        const Spacer(),
+                        Text(r.$4, style: const TextStyle(color: C.dim, fontSize: 12)),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    const Text('الرصيد', style: TextStyle(color: C.dim, fontSize: 12)),
+                    Text(r.$1, style: const TextStyle(fontSize: 36, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Icon(up ? Icons.trending_up_rounded : Icons.trending_down_rounded, color: col, size: 18),
+                        const SizedBox(width: 6),
+                        Text(
+                          '${up ? '+' : ''}${r.$2.toStringAsFixed(2)}\$ ربح الجلسة',
+                          style: TextStyle(color: col, fontWeight: FontWeight.w700, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class _RadarCard extends StatelessWidget {
+            const _RadarCard();
+
+            @override
+            Widget build(BuildContext context) {
+              final r = context.select<QuotexService, (double, double, int, String, bool)>(
+                (s) => (s.crowdCallVolume, s.crowdPutVolume, s.currentSecondInMinute, s.platformFavoredDirection, s.isVolumeDiffReached),
+              );
+              final total = r.$1 + r.$2;
+              final ratio = total > 0 ? r.$1 / total : 0.5;
+              final callFlex = (ratio * 1000).round().clamp(1, 999);
+              return Panel(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.radar_rounded, color: C.blue, size: 20),
+                        const SizedBox(width: 8),
+                        const Text('رادار السيولة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        const Spacer(),
+                        Text('${r.$3.toString().padLeft(2, '0')}s / 60s', style: const TextStyle(color: C.dim, fontSize: 12)),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: LinearProgressIndicator(
+                        value: r.$3 / 60,
+                        minHeight: 5,
+                        backgroundColor: C.line,
+                        valueColor: const AlwaysStoppedAnimation(C.blue),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Row(
+                        children: [
+                          Expanded(flex: callFlex, child: Container(height: 12, color: C.green)),
+                          Expanded(flex: 1000 - callFlex, child: Container(height: 12, color: C.red)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('CALL  \$${r.$1.toStringAsFixed(0)}', style: const TextStyle(color: C.green, fontWeight: FontWeight.w700, fontSize: 12)),
+                        Text('PUT  \$${r.$2.toStringAsFixed(0)}', style: const TextStyle(color: C.red, fontWeight: FontWeight.w700, fontSize: 12)),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text('الاتجاه المقترح: ${r.$4}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                        ),
+                        if (r.$5) const _Tag('الفارق جاهز ✔', C.green),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class _SignalStatsCard extends StatelessWidget {
+            const _SignalStatsCard();
+
+            @override
+            Widget build(BuildContext context) {
+              final r = context.select<QuotexService, (int, String, int, int, int, double)>(
+                (s) => (s.currentSignalStrength, s.currentSignalDirection, s.totalTrades, s.wonTrades, s.lostTrades, s.currentRsi),
+              );
+              final rate = r.$3 > 0 ? (r.$4 * 100 / r.$3) : 0.0;
+              final col = r.$2 == 'CALL' ? C.green : C.red;
+              return Panel(
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 76,
+                      height: 76,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          SizedBox.expand(
+                            child: CircularProgressIndicator(
+                              value: (r.$1 / 100).clamp(0.0, 1.0),
+                              strokeWidth: 7,
+                              backgroundColor: C.line,
+                              valueColor: AlwaysStoppedAnimation(col),
+                            ),
+                          ),
+                          Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text('${r.$1}%', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                              Text(r.$2, style: TextStyle(color: col, fontSize: 10, fontWeight: FontWeight.w700)),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 18),
+                    Expanded(
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          _Stat('الصفقات', '${r.$3}', Colors.white),
+                          _Stat('رابحة', '${r.$4}', C.green),
+                          _Stat('خاسرة', '${r.$5}', C.red),
+                          _Stat('النسبة', '${rate.toStringAsFixed(0)}%', C.amber),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class _GeminiCard extends StatelessWidget {
+            const _GeminiCard();
+
+            @override
+            Widget build(BuildContext context) {
+              final r = context.select<QuotexService, (bool, bool, String, int, String)>(
+                (s) => (s.hasGeminiKey, s.geminiBusy, s.geminiDir, s.geminiConf, s.geminiReason),
+              );
+              final col = r.$3 == 'CALL' ? C.green : (r.$3 == 'PUT' ? C.red : C.amber);
+              return Panel(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.auto_awesome_rounded, color: C.blue, size: 20),
+                        const SizedBox(width: 8),
+                        const Text('تحليل Gemini', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        const Spacer(),
+                        if (r.$3.isNotEmpty) _Tag('${r.$3} ${r.$4}%', col),
+                      ],
+                    ),
+                    if (r.$5.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Text(r.$5, style: const TextStyle(color: C.dim, fontSize: 12.5, height: 1.5)),
+                      ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: (r.$1 && !r.$2) ? () => context.read<QuotexService>().askGemini() : null,
+                        icon: r.$2
+                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.psychology_alt_rounded, size: 20),
+                        label: Text(r.$1 ? (r.$2 ? 'جارٍ التحليل…' : 'اسأل Gemini الآن') : 'أضف مفتاح Gemini من الإعدادات'),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class _Stat extends StatelessWidget {
+            final String label, value;
+            final Color color;
+            const _Stat(this.label, this.value, this.color);
+
+            @override
+            Widget build(BuildContext context) {
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(value, style: TextStyle(color: color, fontWeight: FontWeight.w800, fontSize: 17)),
+                  const SizedBox(height: 2),
+                  Text(label, style: const TextStyle(color: C.dim, fontSize: 10.5)),
+                ],
+              );
+            }
+          }
+
+          class _BotButton extends StatelessWidget {
+            const _BotButton();
+
+            @override
+            Widget build(BuildContext context) {
+              final r = context.select<QuotexService, (bool, bool, int)>(
+                (s) => (s.isAutoTrading, s.isTradeOpen, s.remainingSeconds),
+              );
+              final running = r.$1;
+              return Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    height: 56,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: running ? C.red : C.green,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      ),
+                      onPressed: () => context.read<QuotexService>().toggleAutoTrading(),
+                      icon: Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded, size: 26),
+                      label: Text(
+                        running ? 'إيقاف التداول الآلي' : 'تشغيل التداول الآلي',
+                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ),
+                  if (r.$2)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: _Tag('صفقة مفتوحة • متبقي ${r.$3} ث', C.amber),
+                    ),
+                ],
+              );
+            }
+          }
+
+          class _ManualTrade extends StatelessWidget {
+            const _ManualTrade();
+
+            void _go(BuildContext context, String dir) {
+              final s = context.read<QuotexService>();
+              s.placeOrder(asset: s.activeAsset, direction: dir, amount: s.baseAmount, duration: s.tradeDuration);
             }
 
             @override
             Widget build(BuildContext context) {
-              final service = context.watch<QuotexService>();
-
-              return Scaffold(
-                appBar: AppBar(
-                  backgroundColor: const Color(0xFF111827),
-                  elevation: 0,
-                  title: Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(7),
-                        decoration: BoxDecoration(
-                          gradient: const LinearGradient(
-                            colors: [Color(0xFF10B981), Color(0xFF059669)],
-                          ),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: const Icon(Icons.psychology_rounded, color: Colors.white, size: 22),
+              return Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: C.green,
+                        side: const BorderSide(color: C.green),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                       ),
-                      const SizedBox(width: 10),
-                      const Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text("QuMatix Deep AI v9.5", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text("رادار الدقيقة الواحدة المتزامن (00s - 60s) + الذكاء الاصطناعي", style: TextStyle(fontSize: 9.5, color: Colors.white60)),
-                        ],
-                      ),
-                    ],
-                  ),
-                  actions: [
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      child: Center(
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                          decoration: BoxDecoration(
-                            color: service.isConnected
-                                ? const Color(0xFF064E3B)
-                                : const Color(0xFF7F1D1D),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                              color: service.isConnected
-                                  ? const Color(0xFF10B981)
-                                  : const Color(0xFFEF4444),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                Icons.circle,
-                                size: 8,
-                                color: service.isConnected ? const Color(0xFF10B981) : const Color(0xFFEF4444),
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                service.isConnected ? "متصل بالسيرفر" : "غير متصل",
-                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
+                      onPressed: () => _go(context, 'call'),
+                      icon: const Icon(Icons.arrow_upward_rounded),
+                      label: const Text('CALL', style: TextStyle(fontWeight: FontWeight.w800)),
                     ),
-                  ],
-                ),
-                body: IndexedStack(
-                  index: _currentTab,
-                  children: [
-                    _buildBotDashboardTab(context, service),
-                    QuotexPlatformView(
-                      onConnectedSuccess: () {
-                        setState(() => _currentTab = 0);
-                      },
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: C.red,
+                        side: const BorderSide(color: C.red),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                      ),
+                      onPressed: () => _go(context, 'put'),
+                      icon: const Icon(Icons.arrow_downward_rounded),
+                      label: const Text('PUT', style: TextStyle(fontWeight: FontWeight.w800)),
                     ),
-                    _buildRiskAndLogsTab(context, service),
-                  ],
-                ),
-                bottomNavigationBar: Container(
-                  decoration: const BoxDecoration(
-                    border: Border(top: BorderSide(color: Color(0xFF1F2937))),
                   ),
-                  child: BottomNavigationBar(
-                    currentIndex: _currentTab,
-                    backgroundColor: const Color(0xFF111827),
-                    selectedItemColor: const Color(0xFF10B981),
-                    unselectedItemColor: Colors.white54,
-                    type: BottomNavigationBarType.fixed,
-                    selectedLabelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                    unselectedLabelStyle: const TextStyle(fontSize: 11),
-                    onTap: (idx) => setState(() => _currentTab = idx),
-                    items: const [
-                      BottomNavigationBarItem(
-                        icon: Icon(Icons.smart_toy_rounded),
-                        label: "لوحة البوت",
-                      ),
-                      BottomNavigationBarItem(
-                        icon: Icon(Icons.candlestick_chart_rounded),
-                        label: "المنصة والشارت",
-                      ),
-                      BottomNavigationBarItem(
-                        icon: Icon(Icons.tune_rounded),
-                        label: "الإعدادات والسجل",
-                      ),
-                    ],
-                  ),
-                ),
+                ],
               );
             }
+          }
 
-            Widget _buildBotDashboardTab(BuildContext context, QuotexService service) {
-              final bool signalReady = service.currentSignalStrength >= _selectedMinStrength;
-              final double totalVol = service.crowdCallVolume + service.crowdPutVolume;
-              final double callRatio = totalVol > 0 ? (service.crowdCallVolume / totalVol) : 0.5;
+          // ───────────────────────── الإعدادات ─────────────────────────
+          class SettingsTab extends StatefulWidget {
+            const SettingsTab({super.key});
 
-              return SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // 1. بطاقة الرصيد المباشر وحالة الاتصال
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(18),
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          colors: [Color(0xFF1E293B), Color(0xFF0F172A)],
-                          begin: Alignment.topRight,
-                          end: Alignment.bottomLeft,
-                        ),
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(color: Colors.white12),
-                      ),
-                      child: Column(
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    "رصيد الحساب المباشر",
-                                    style: TextStyle(color: Colors.white60, fontSize: 12.5),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    service.balance > 0
-                                        ? "\$${service.balance.toStringAsFixed(2)}"
-                                        : service.balanceText,
-                                    style: const TextStyle(
-                                      fontSize: 28,
-                                      fontWeight: FontWeight.bold,
-                                      color: Color(0xFF10B981),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    "صافي ربح الجلسة: ${service.netProfit >= 0 ? '+' : ''}\$${service.netProfit.toStringAsFixed(2)}",
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.bold,
-                                      color: service.netProfit >= 0 ? Colors.greenAccent : Colors.redAccent,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              Container(
-                                padding: const EdgeInsets.all(4),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF0B0F19),
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(color: Colors.white10),
-                                ),
-                                child: Row(
-                                  children: [
-                                    _accountSegmentButton(
-                                      title: "تجريبي",
-                                      selected: !_isRealAccount,
-                                      activeColor: const Color(0xFF2563EB),
-                                      onTap: () {
-                                        setState(() => _isRealAccount = false);
-                                        _syncSettings(service);
-                                      },
-                                    ),
-                                    _accountSegmentButton(
-                                      title: "حقيقي",
-                                      selected: _isRealAccount,
-                                      activeColor: const Color(0xFFD97706),
-                                      onTap: () {
-                                        setState(() => _isRealAccount = true);
-                                        _syncSettings(service);
-                                      },
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF0B0F19),
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(color: Colors.white10),
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Flexible(
-                                  child: Text(
-                                    "الزوج: ${service.activeAsset} | السعر: ${service.lastPrice > 0 ? service.lastPrice.toStringAsFixed(5) : 'جاري القراءة...'}",
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Colors.cyanAccent),
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  service.isTradeOpen
-                                      ? "⏳ صفقة جارية (${service.remainingSeconds}s)"
-                                      : "مصلحة المنصة: ${service.platformFavoredDirection}",
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.bold,
-                                    color: service.isTradeOpen ? Colors.amberAccent : const Color(0xFF10B981),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: service.isConnected
-                                    ? const Color(0xFF1F2937)
-                                    : const Color(0xFF2563EB),
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 12),
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                              ),
-                              onPressed: () {
-                                setState(() => _currentTab = 1);
-                              },
-                              icon: Icon(
-                                service.isConnected ? Icons.candlestick_chart_rounded : Icons.login_rounded,
-                                size: 18,
-                              ),
-                              label: Text(
-                                service.isConnected
-                                    ? "فتح شاشة المنصة (${service.currentDomain})"
-                                    : "تسجيل الدخول وربط حساب المنصة الآن",
-                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
+            @override
+            State<SettingsTab> createState() => _SettingsTabState();
+          }
 
-                    // =========================================================================
-                    // 2. بطاقة رادار الدقيقة الواحدة المتزامن مع بداية كل دقيقة (00s -> 60s)
-                    // =========================================================================
-                    Container(
-                      padding: const EdgeInsets.all(15),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF111827),
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(
-                          color: service.isVolumeDiffReached ? const Color(0xFF10B981) : const Color(0xFF3B82F6),
-                          width: 1.3,
-                        ),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              const Row(
-                                children: [
-                                  Icon(Icons.timer_rounded, color: Color(0xFFF59E0B), size: 20),
-                                  SizedBox(width: 6),
-                                  Text(
-                                    "رادار سيولة الدقيقة الحالية فقط:",
-                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12.5),
-                                  ),
-                                ],
-                              ),
-                              Row(
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF0B0F19),
-                                      borderRadius: BorderRadius.circular(8),
-                                      border: Border.all(color: Colors.white12),
-                                    ),
-                                    child: Text(
-                                      "الثانية: ${service.currentSecondInMinute.toString().padLeft(2, '0')}s / 60s",
-                                      style: const TextStyle(fontSize: 11, color: Colors.cyanAccent, fontWeight: FontWeight.bold),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-                                    decoration: BoxDecoration(
-                                      color: service.isVolumeDiffReached ? const Color(0xFF064E3B) : const Color(0xFF1E293B),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    child: Text(
-                                      "الفارق: \$${service.currentVolumeDiff.toStringAsFixed(0)}",
-                                      style: TextStyle(
-                                        fontSize: 11.5,
-                                        fontWeight: FontWeight.bold,
-                                        color: service.isVolumeDiffReached ? const Color(0xFF34D399) : Colors.amberAccent,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          // شريط تقدم ثواني الدقيقة الحالية (من الثانية 00 إلى 60)
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(4),
-                            child: LinearProgressIndicator(
-                              value: (service.currentSecondInMinute / 60.0).clamp(0.0, 1.0),
-                              minHeight: 4,
-                              backgroundColor: const Color(0xFF0B0F19),
-                              valueColor: const AlwaysStoppedAnimation<Color>(Colors.cyanAccent),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text(
-                                "دخول الناس CALL: \$${service.crowdCallVolume.toStringAsFixed(0)}",
-                                style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold, fontSize: 12.5),
-                              ),
-                              Text(
-                                "دخول الناس PUT: \$${service.crowdPutVolume.toStringAsFixed(0)}",
-                                style: const TextStyle(color: Color(0xFFEF4444), fontWeight: FontWeight.bold, fontSize: 12.5),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 6),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(8),
-                            child: LinearProgressIndicator(
-                              value: callRatio.clamp(0.05, 0.95),
-                              minHeight: 10,
-                              backgroundColor: const Color(0xFFEF4444),
-                              valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF10B981)),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF0B0F19),
-                              borderRadius: BorderRadius.circular(9),
-                            ),
-                            child: Text(
-                              service.crowdCallVolume > service.crowdPutVolume
-                                  ? "💡 في هذه الدقيقة دخل الناس CALL أكثر (\$${service.crowdCallVolume.toStringAsFixed(0)}) -> مصلحة المنصة: PUT ⬇"
-                                  : (service.crowdPutVolume > service.crowdCallVolume
-                                      ? "💡 في هذه الدقيقة دخل الناس PUT أكثر (\$${service.crowdPutVolume.toStringAsFixed(0)}) -> مصلحة المنصة: CALL ⬆"
-                                      : "⏳ بداية دقيقة جديدة (00s) — جاري حساب السيولة التي تدخل في هذه الدقيقة فقط..."),
-                              style: const TextStyle(fontSize: 11.5, color: Colors.cyanAccent, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                flex: 3,
-                                child: TextField(
-                                  controller: _diffController,
-                                  keyboardType: TextInputType.number,
-                                  decoration: InputDecoration(
-                                    labelText: "حدد الفارق المطلوب في الدقيقة (\$)",
-                                    filled: true,
-                                    fillColor: const Color(0xFF0B0F19),
-                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                  ),
-                                  onChanged: (_) => _syncSettings(service),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                flex: 3,
-                                child: DropdownButtonFormField<bool>(
-                                  value: _enterAtMinuteEndOnly,
-                                  isExpanded: true,
-                                  decoration: InputDecoration(
-                                    labelText: "توقيت دخول الصفقة",
-                                    filled: true,
-                                    fillColor: const Color(0xFF0B0F19),
-                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(value: true, child: Text("نهاية الدقيقة (بعد رصد 60s)")),
-                                    DropdownMenuItem(value: false, child: Text("فوراً عند بلوغ الفارق")),
-                                  ],
-                                  onChanged: (val) {
-                                    setState(() => _enterAtMinuteEndOnly = val!);
-                                    _syncSettings(service);
-                                  },
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              _diffQuickChip(250, "\$250", service),
-                              _diffQuickChip(500, "\$500", service),
-                              _diffQuickChip(1000, "\$1000", service),
-                              _diffQuickChip(1500, "\$1500", service),
-                              _diffQuickChip(2000, "\$2000", service),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
+          class _SettingsTabState extends State<SettingsTab> {
+            final _amount = TextEditingController(text: '1');
+            final _tp = TextEditingController(text: '50');
+            final _sl = TextEditingController(text: '25');
+            final _diff = TextEditingController(text: '250');
+            final _gKey = TextEditingController();
+            final _gModel = TextEditingController(text: 'gemini-2.5-flash');
+            bool _gGate = false;
 
-                    // 3. بطاقة قياس قوة إشارة الذكاء الاصطناعي المحلي (70% - 95%)
-                    Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF111827),
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(
-                          color: signalReady ? const Color(0xFF10B981) : Colors.white12,
-                        ),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Row(
-                                children: [
-                                  Icon(
-                                    Icons.psychology_alt_rounded,
-                                    color: signalReady ? const Color(0xFF10B981) : const Color(0xFF3B82F6),
-                                    size: 20,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  const Text(
-                                    "قوة إشارة الذكاء الاصطناعي الخماسي:",
-                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12.5),
-                                  ),
-                                ],
-                              ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                decoration: BoxDecoration(
-                                  color: signalReady ? const Color(0xFF064E3B) : const Color(0xFF1E293B),
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                                child: Text(
-                                  "${service.currentSignalStrength}% (${service.currentSignalDirection})",
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 12,
-                                    color: signalReady ? const Color(0xFF34D399) : Colors.amberAccent,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              _strengthChip(70, "70%"),
-                              _strengthChip(75, "75%"),
-                              _strengthChip(80, "80%"),
-                              _strengthChip(85, "85%"),
-                              _strengthChip(90, "90% 🔥"),
-                              _strengthChip(95, "95%"),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
+            String _asset = 'AUTO_CHART';
+            String _strategy = 'platform_interest_contrarian';
+            int _duration = 60;
+            int _strength = 80;
+            bool _martingale = true;
+            bool _minuteEnd = true;
+            bool _real = false;
 
-                    // 4. شبكة الإحصائيات الرباعية
-                    Row(
+            static const _assets = [
+              'AUTO_CHART',
+              'EUR/USD (OTC)',
+              'GBP/USD (OTC)',
+              'USD/JPY (OTC)',
+              'AUD/CAD (OTC)',
+              'AUD/CHF (OTC)',
+              'AUD/JPY (OTC)',
+              'AUD/NZD (OTC)',
+              'AUD/USD (OTC)',
+              'CAD/CHF (OTC)',
+              'CAD/JPY (OTC)',
+              'CHF/JPY (OTC)',
+              'EUR/AUD (OTC)',
+              'EUR/CAD (OTC)',
+              'EUR/CHF (OTC)',
+              'EUR/GBP (OTC)',
+              'EUR/JPY (OTC)',
+              'EUR/NZD (OTC)',
+              'GBP/AUD (OTC)',
+              'GBP/CAD (OTC)',
+              'GBP/CHF (OTC)',
+              'GBP/JPY (OTC)',
+              'GBP/NZD (OTC)',
+              'NZD/CAD (OTC)',
+              'NZD/CHF (OTC)',
+              'NZD/JPY (OTC)',
+              'NZD/USD (OTC)',
+              'USD/CAD (OTC)',
+              'USD/CHF (OTC)',
+              'USD/BRL (OTC)',
+              'USD/EGP (OTC)',
+              'USD/TRY (OTC)',
+              'USD/INR (OTC)',
+              'USD/PKR (OTC)',
+              'USD/BDT (OTC)',
+              'USD/ARS (OTC)',
+              'USD/MXN (OTC)',
+              'USD/NGN (OTC)',
+              'USD/PHP (OTC)',
+              'USD/IDR (OTC)',
+              'USD/COP (OTC)',
+              'USD/DZD (OTC)',
+              'Gold (OTC)',
+              'Silver (OTC)',
+              'UKBrent (OTC)',
+              'USCrude (OTC)',
+              'Bitcoin (OTC)',
+              'Ethereum (OTC)',
+            ];
+            static const _strategies = {
+              'platform_interest_contrarian': 'رادار السيولة',
+              'hybrid_ai_contrarian': 'مدمج (رادار + مؤشرات)',
+              'local_deep_ai': 'محرك المؤشرات',
+              'qumatix_rsi_ema': 'RSI + EMA',
+              'trend_momentum': 'Trend Pro',
+              'reversal_sniper': 'Sniper',
+            };
+
+            @override
+            void dispose() {
+              _amount.dispose();
+              _tp.dispose();
+              _sl.dispose();
+              _diff.dispose();
+              _gKey.dispose();
+              _gModel.dispose();
+              super.dispose();
+            }
+
+            void _sync() {
+              context.read<QuotexService>().updateSettings(
+                    asset: _asset,
+                    duration: _duration,
+                    baseAmount: double.tryParse(_amount.text) ?? 1.0,
+                    useMartingale: _martingale,
+                    takeProfit: double.tryParse(_tp.text) ?? 50.0,
+                    stopLoss: double.tryParse(_sl.text) ?? 25.0,
+                    strategy: _strategy,
+                    isRealAccount: _real,
+                    minSignalStrength: _strength,
+                    requiredVolumeDiff: double.tryParse(_diff.text) ?? 250.0,
+                    enterAtMinuteEndOnly: _minuteEnd,
+                  );
+            }
+
+            void _set(VoidCallback f) {
+              setState(f);
+              _sync();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final hasKey = context.select<QuotexService, bool>((s) => s.hasGeminiKey);
+              return ListView(
+                padding: const EdgeInsets.fromLTRB(14, 6, 14, 24),
+                children: [
+                  _geminiPanel(hasKey),
+                  const SizedBox(height: 12),
+                  _collectorPanel(),
+                  const SizedBox(height: 12),
+                  Panel(
+                    child: Column(
                       children: [
-                        Expanded(
-                          child: _metricCard(
-                            title: "إجمالي الصفقات",
-                            value: "${service.totalTrades}",
-                            icon: Icons.swap_vert_circle_rounded,
-                            color: const Color(0xFF60A5FA),
-                          ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('حساب حقيقي', style: TextStyle(fontWeight: FontWeight.w700)),
+                          subtitle: Text(_real ? 'تحذير: تداول بأموال حقيقية' : 'وضع تجريبي', style: TextStyle(color: _real ? C.amber : C.dim, fontSize: 12)),
+                          value: _real,
+                          activeColor: C.amber,
+                          onChanged: (v) => _set(() => _real = v),
                         ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _metricCard(
-                            title: "صفقات رابحة",
-                            value: "${service.wonTrades}",
-                            icon: Icons.trending_up_rounded,
-                            color: const Color(0xFF10B981),
-                          ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('مضاعفة بعد الخسارة (Martingale)', style: TextStyle(fontWeight: FontWeight.w700)),
+                          subtitle: const Text('يرفع حجم الخسارة المحتملة بسرعة', style: TextStyle(color: C.dim, fontSize: 12)),
+                          value: _martingale,
+                          onChanged: (v) => _set(() => _martingale = v),
                         ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _metricCard(
-                            title: "صفقات خاسرة",
-                            value: "${service.lostTrades}",
-                            icon: Icons.trending_down_rounded,
-                            color: const Color(0xFFEF4444),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _metricCard(
-                            title: "مؤشر RSI",
-                            value: service.currentRsi.toStringAsFixed(1),
-                            icon: Icons.speed_rounded,
-                            color: const Color(0xFFF59E0B),
-                          ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('الدخول عند نهاية الدقيقة فقط', style: TextStyle(fontWeight: FontWeight.w700)),
+                          value: _minuteEnd,
+                          onChanged: (v) => _set(() => _minuteEnd = v),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 12),
-
-                    // 5. إعدادات الاستراتيجية والزوج والتشغيل المباشر
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF111827),
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(color: Colors.white10),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              const Row(
-                                children: [
-                                  Icon(Icons.memory_rounded, color: Color(0xFF10B981), size: 20),
-                                  SizedBox(width: 8),
-                                  Text(
-                                    "محرك الاستراتيجية والتنفيذ",
-                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                                  ),
-                                ],
-                              ),
-                              Flexible(
-                                child: Text(
-                                  service.lastSignal,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          DropdownButtonFormField<String>(
-                            value: _selectedStrategy,
-                            isExpanded: true,
-                            decoration: InputDecoration(
-                              labelText: "اختر استراتيجية التداول الآلي",
-                              filled: true,
-                              fillColor: const Color(0xFF0B0F19),
-                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            ),
-                            items: const [
-                              DropdownMenuItem(
-                                value: "platform_interest_contrarian",
-                                child: Text("مصلحة المنصة: عكس سيولة الدقيقة (الأقل دخولاً يربح 💰)"),
-                              ),
-                              DropdownMenuItem(
-                                value: "hybrid_ai_contrarian",
-                                child: Text("مدمج: رادار الدقيقة + الذكاء الاصطناعي العميق معاً 🔥"),
-                              ),
-                              DropdownMenuItem(
-                                value: "local_deep_ai",
-                                child: Text("الذكاء الاصطناعي العميق الخماسي (Deep AI Ensemble 🧠)"),
-                              ),
-                              DropdownMenuItem(
-                                value: "qumatix_rsi_ema",
-                                child: Text("خوارزمية QuMatix الشاملة (RSI + EMA + MACD)"),
-                              ),
-                              DropdownMenuItem(
-                                value: "trend_momentum",
-                                child: Text("تتبع الزخم والاتجاه (Trend Pro)"),
-                              ),
-                              DropdownMenuItem(
-                                value: "reversal_sniper",
-                                child: Text("قناص الارتداد السعري (Bollinger + Stochastic)"),
-                              ),
-                            ],
-                            onChanged: (val) {
-                              setState(() => _selectedStrategy = val!);
-                              _syncSettings(service);
-                            },
-                          ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                flex: 3,
-                                child: DropdownButtonFormField<String>(
-                                  value: _selectedAsset,
-                                  isExpanded: true,
-                                  decoration: InputDecoration(
-                                    labelText: "زوج العملات (تنفيذ مباشر عبر السيرفر)",
-                                    filled: true,
-                                    fillColor: const Color(0xFF0B0F19),
-                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(value: "AUTO_CHART", child: Text("تلقائي: الزوج المفتوح بالشارت حالياً")),
-                                    DropdownMenuItem(value: "EUR/USD (OTC)", child: Text("EUR/USD (OTC)")),
-                                    DropdownMenuItem(value: "GBP/USD (OTC)", child: Text("GBP/USD (OTC)")),
-                                    DropdownMenuItem(value: "USD/JPY (OTC)", child: Text("USD/JPY (OTC)")),
-                                    DropdownMenuItem(value: "AUD/CAD (OTC)", child: Text("AUD/CAD (OTC)")),
-                                    DropdownMenuItem(value: "AUD/CHF (OTC)", child: Text("AUD/CHF (OTC)")),
-                                    DropdownMenuItem(value: "AUD/JPY (OTC)", child: Text("AUD/JPY (OTC)")),
-                                    DropdownMenuItem(value: "AUD/NZD (OTC)", child: Text("AUD/NZD (OTC)")),
-                                    DropdownMenuItem(value: "AUD/USD (OTC)", child: Text("AUD/USD (OTC)")),
-                                    DropdownMenuItem(value: "CAD/CHF (OTC)", child: Text("CAD/CHF (OTC)")),
-                                    DropdownMenuItem(value: "CAD/JPY (OTC)", child: Text("CAD/JPY (OTC)")),
-                                    DropdownMenuItem(value: "CHF/JPY (OTC)", child: Text("CHF/JPY (OTC)")),
-                                    DropdownMenuItem(value: "EUR/AUD (OTC)", child: Text("EUR/AUD (OTC)")),
-                                    DropdownMenuItem(value: "EUR/CAD (OTC)", child: Text("EUR/CAD (OTC)")),
-                                    DropdownMenuItem(value: "EUR/CHF (OTC)", child: Text("EUR/CHF (OTC)")),
-                                    DropdownMenuItem(value: "EUR/GBP (OTC)", child: Text("EUR/GBP (OTC)")),
-                                    DropdownMenuItem(value: "EUR/JPY (OTC)", child: Text("EUR/JPY (OTC)")),
-                                    DropdownMenuItem(value: "EUR/NZD (OTC)", child: Text("EUR/NZD (OTC)")),
-                                    DropdownMenuItem(value: "GBP/AUD (OTC)", child: Text("GBP/AUD (OTC)")),
-                                    DropdownMenuItem(value: "GBP/CAD (OTC)", child: Text("GBP/CAD (OTC)")),
-                                    DropdownMenuItem(value: "GBP/CHF (OTC)", child: Text("GBP/CHF (OTC)")),
-                                    DropdownMenuItem(value: "GBP/JPY (OTC)", child: Text("GBP/JPY (OTC)")),
-                                    DropdownMenuItem(value: "GBP/NZD (OTC)", child: Text("GBP/NZD (OTC)")),
-                                    DropdownMenuItem(value: "NZD/CAD (OTC)", child: Text("NZD/CAD (OTC)")),
-                                    DropdownMenuItem(value: "NZD/CHF (OTC)", child: Text("NZD/CHF (OTC)")),
-                                    DropdownMenuItem(value: "NZD/JPY (OTC)", child: Text("NZD/JPY (OTC)")),
-                                    DropdownMenuItem(value: "NZD/USD (OTC)", child: Text("NZD/USD (OTC)")),
-                                    DropdownMenuItem(value: "USD/CAD (OTC)", child: Text("USD/CAD (OTC)")),
-                                    DropdownMenuItem(value: "USD/CHF (OTC)", child: Text("USD/CHF (OTC)")),
-                                    DropdownMenuItem(value: "USD/BRL (OTC)", child: Text("USD/BRL (OTC)")),
-                                    DropdownMenuItem(value: "USD/EGP (OTC)", child: Text("USD/EGP (OTC)")),
-                                    DropdownMenuItem(value: "USD/TRY (OTC)", child: Text("USD/TRY (OTC)")),
-                                    DropdownMenuItem(value: "USD/INR (OTC)", child: Text("USD/INR (OTC)")),
-                                    DropdownMenuItem(value: "USD/PKR (OTC)", child: Text("USD/PKR (OTC)")),
-                                    DropdownMenuItem(value: "USD/BDT (OTC)", child: Text("USD/BDT (OTC)")),
-                                    DropdownMenuItem(value: "USD/ARS (OTC)", child: Text("USD/ARS (OTC)")),
-                                    DropdownMenuItem(value: "USD/MXN (OTC)", child: Text("USD/MXN (OTC)")),
-                                    DropdownMenuItem(value: "USD/NGN (OTC)", child: Text("USD/NGN (OTC)")),
-                                    DropdownMenuItem(value: "USD/PHP (OTC)", child: Text("USD/PHP (OTC)")),
-                                    DropdownMenuItem(value: "USD/IDR (OTC)", child: Text("USD/IDR (OTC)")),
-                                    DropdownMenuItem(value: "USD/COP (OTC)", child: Text("USD/COP (OTC)")),
-                                    DropdownMenuItem(value: "USD/DZD (OTC)", child: Text("USD/DZD (OTC)")),
-                                    DropdownMenuItem(value: "Gold (OTC)", child: Text("Gold / الذهب (OTC)")),
-                                    DropdownMenuItem(value: "Silver (OTC)", child: Text("Silver / الفضة (OTC)")),
-                                    DropdownMenuItem(value: "UKBrent (OTC)", child: Text("UKBrent / النفط (OTC)")),
-                                    DropdownMenuItem(value: "USCrude (OTC)", child: Text("USCrude / الخام (OTC)")),
-                                    DropdownMenuItem(value: "Bitcoin (OTC)", child: Text("Bitcoin (OTC)")),
-                                    DropdownMenuItem(value: "Ethereum (OTC)", child: Text("Ethereum (OTC)")),
-                                    DropdownMenuItem(value: "EUR/USD", child: Text("EUR/USD (مباشر)")),
-                                    DropdownMenuItem(value: "GBP/USD", child: Text("GBP/USD (مباشر)")),
-                                    DropdownMenuItem(value: "USD/JPY", child: Text("USD/JPY (مباشر)")),
-                                    DropdownMenuItem(value: "AUD/USD", child: Text("AUD/USD (مباشر)")),
-                                    DropdownMenuItem(value: "USD/CAD", child: Text("USD/CAD (مباشر)")),
-                                  ],
-                                  onChanged: (val) {
-                                    setState(() => _selectedAsset = val!);
-                                    _syncSettings(service);
-                                  },
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                flex: 2,
-                                child: TextField(
-                                  controller: _amountController,
-                                  keyboardType: TextInputType.number,
-                                  decoration: InputDecoration(
-                                    labelText: "المبلغ (\$)",
-                                    filled: true,
-                                    fillColor: const Color(0xFF0B0F19),
-                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
-                                  ),
-                                  onChanged: (_) => _syncSettings(service),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          const Text("مدة الصفقة الزمنية:", style: TextStyle(fontSize: 12, color: Colors.white70)),
-                          const SizedBox(height: 8),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              _durationChip(5, "5 ث"),
-                              _durationChip(15, "15 ث"),
-                              _durationChip(30, "30 ث"),
-                              _durationChip(60, "1 د"),
-                              _durationChip(120, "2 د"),
-                              _durationChip(300, "5 د"),
-                            ],
-                          ),
-                          const SizedBox(height: 16),
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: service.isAutoTrading
-                                    ? const Color(0xFFD97706)
-                                    : const Color(0xFF10B981),
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 15),
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                                elevation: 4,
-                              ),
-                              onPressed: () {
-                                _syncSettings(service);
-                                service.toggleAutoTrading();
-                              },
-                              icon: Icon(
-                                service.isAutoTrading ? Icons.stop_circle_rounded : Icons.play_circle_fill_rounded,
-                                size: 22,
-                              ),
-                              label: Text(
-                                service.isAutoTrading
-                                    ? "إيقاف البوت (يرصد الدقيقة الحالية: فارق \$${_diffController.text}+)"
-                                    : "تشغيل رادار الدقيقة الواحدة (فارق \$${_diffController.text}+)",
-                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: ElevatedButton.icon(
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFF059669),
-                                    foregroundColor: Colors.white,
-                                    padding: const EdgeInsets.symmetric(vertical: 13),
-                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                                  ),
-                                  onPressed: () {
-                                    final amt = double.tryParse(_amountController.text) ?? 1.0;
-                                    service.placeOrder(
-                                      asset: service.activeAsset,
-                                      direction: "call",
-                                      amount: amt,
-                                      duration: _selectedDuration,
-                                    );
-                                  },
-                                  icon: const Icon(Icons.trending_up_rounded, size: 20),
-                                  label: const Text("شراء مباشر (CALL)", style: TextStyle(fontWeight: FontWeight.bold)),
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: ElevatedButton.icon(
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFFDC2626),
-                                    foregroundColor: Colors.white,
-                                    padding: const EdgeInsets.symmetric(vertical: 13),
-                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                                  ),
-                                  onPressed: () {
-                                    final amt = double.tryParse(_amountController.text) ?? 1.0;
-                                    service.placeOrder(
-                                      asset: service.activeAsset,
-                                      direction: "put",
-                                      amount: amt,
-                                      duration: _selectedDuration,
-                                    );
-                                  },
-                                  icon: const Icon(Icons.trending_down_rounded, size: 20),
-                                  label: const Text("بيع مباشر (PUT)", style: TextStyle(fontWeight: FontWeight.bold)),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
+                  ),
+                  const SizedBox(height: 12),
+                  Panel(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _dropdown('الاستراتيجية', _strategy, _strategies, (v) => _set(() => _strategy = v)),
+                        const SizedBox(height: 14),
+                        _dropdown('الزوج', _asset, {for (final a in _assets) a: a == 'AUTO_CHART' ? 'تلقائي (الشارت)' : a}, (v) => _set(() => _asset = v)),
+                        const SizedBox(height: 16),
+                        const Text('مدة الصفقة', style: TextStyle(color: C.dim, fontSize: 12)),
+                        const SizedBox(height: 8),
+                        Wrap(spacing: 8, runSpacing: 8, children: [
+                          for (final e in {30: '30ث', 60: '1د', 120: '2د', 180: '3د', 300: '5د'}.entries)
+                            _chip(e.value, _duration == e.key, C.blue, () => _set(() => _duration = e.key)),
+                        ]),
+                        const SizedBox(height: 16),
+                        const Text('أدنى قوة إشارة', style: TextStyle(color: C.dim, fontSize: 12)),
+                        const SizedBox(height: 8),
+                        Wrap(spacing: 8, runSpacing: 8, children: [
+                          for (final p in [60, 70, 80, 90])
+                            _chip('$p%', _strength == p, C.green, () => _set(() => _strength = p)),
+                        ]),
+                      ],
                     ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 12),
+                  Panel(
+                    child: Column(
+                      children: [
+                        Row(children: [
+                          Expanded(child: _num('مبلغ الصفقة', _amount)),
+                          const SizedBox(width: 10),
+                          Expanded(child: _num('فارق السيولة', _diff)),
+                        ]),
+                        const SizedBox(height: 12),
+                        Row(children: [
+                          Expanded(child: _num('هدف الربح', _tp)),
+                          const SizedBox(width: 10),
+                          Expanded(child: _num('وقف الخسارة', _sl)),
+                        ]),
+                      ],
+                    ),
+                  ),
+                ],
               );
             }
 
-            Widget _buildRiskAndLogsTab(BuildContext context, QuotexService service) {
-              return SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
+            Widget _collectorPanel() {
+              final r = context.select<QuotexService, (bool, bool, double, int, String, bool)>(
+                (s) => (s.collectEnabled, s.training, s.dataMegabytes, s.collectedPairs, s.modelInfo, s.modelActive),
+              );
+              return Panel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF111827),
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(color: Colors.white10),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Row(
-                            children: [
-                              Icon(Icons.shield_rounded, color: Color(0xFF3B82F6), size: 20),
-                              SizedBox(width: 8),
-                              Text("إدارة رأس المال والمخاطر", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                            ],
-                          ),
-                          const SizedBox(height: 14),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: TextField(
-                                  controller: _tpController,
-                                  keyboardType: TextInputType.number,
-                                  decoration: InputDecoration(
-                                    labelText: "هدف الربح اليومي (\$)",
-                                    filled: true,
-                                    fillColor: const Color(0xFF0B0F19),
-                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                                  ),
-                                  onChanged: (_) => _syncSettings(service),
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: TextField(
-                                  controller: _slController,
-                                  keyboardType: TextInputType.number,
-                                  decoration: InputDecoration(
-                                    labelText: "حد وقف الخسارة (\$)",
-                                    filled: true,
-                                    fillColor: const Color(0xFF0B0F19),
-                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                                  ),
-                                  onChanged: (_) => _syncSettings(service),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          SwitchListTile(
-                            contentPadding: EdgeInsets.zero,
-                            title: const Text("المضاعفة الذكية عند الخسارة (Martingale x2)", style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold)),
-                            subtitle: const Text("مضاعفة قيمة الصفقة تلقائياً لتعويض الخسارة السابقة", style: TextStyle(fontSize: 11.5, color: Colors.white54)),
-                            value: _useMartingale,
-                            activeColor: const Color(0xFF10B981),
-                            onChanged: (val) {
-                              setState(() => _useMartingale = val);
-                              _syncSettings(service);
-                            },
-                          ),
-                        ],
-                      ),
+                    Row(
+                      children: [
+                        const Icon(Icons.storage_rounded, color: C.blue, size: 20),
+                        const SizedBox(width: 8),
+                        const Text('بيانات OTC والنموذج', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        const Spacer(),
+                        _Tag(r.$6 ? 'النموذج مفعّل' : 'غير مفعّل', r.$6 ? C.green : C.amber),
+                      ],
                     ),
-                    const SizedBox(height: 16),
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF111827),
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(color: Colors.white10),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Row(
-                            children: [
-                              Icon(Icons.terminal_rounded, color: Color(0xFF10B981), size: 20),
-                              SizedBox(width: 8),
-                              Text("سجل عمليات السيرفر المباشر", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                            ],
-                          ),
-                          const SizedBox(height: 10),
-                          Container(
-                            height: 260,
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF05080F),
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.white10),
-                            ),
-                            child: service.logs.isEmpty
-                                ? const Center(
-                                    child: Text("لا توجد أحداث مسجلة بعد...", style: TextStyle(color: Colors.white38, fontSize: 12)),
-                                  )
-                                : ListView.builder(
-                                    itemCount: service.logs.length,
-                                    itemBuilder: (context, idx) => Padding(
-                                      padding: const EdgeInsets.symmetric(vertical: 2),
-                                      child: Text(
-                                        service.logs[idx],
-                                        style: const TextStyle(color: Color(0xFF34D399), fontSize: 11.5, fontFamily: 'monospace'),
-                                      ),
-                                    ),
-                                  ),
-                          ),
-                        ],
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('جمع أسعار أزواج OTC من سيرفر Quotex', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                      subtitle: const Text('يدور على الأزواج أثناء عدم وجود صفقات', style: TextStyle(color: C.dim, fontSize: 12)),
+                      value: r.$1,
+                      onChanged: (v) => context.read<QuotexService>().setCollect(v),
+                    ),
+                    Text('${r.$3.toStringAsFixed(1)} MB مخزّنة • ${r.$4} زوجاً في هذه الجلسة', style: const TextStyle(color: C.dim, fontSize: 12)),
+                    const SizedBox(height: 4),
+                    Text(r.$5, style: const TextStyle(color: C.dim, fontSize: 12, height: 1.5)),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: r.$2 ? null : () => context.read<QuotexService>().trainModelNow(),
+                        child: Text(r.$2 ? 'جارٍ التدريب…' : 'درّب النموذج الآن'),
                       ),
                     ),
                   ],
@@ -2840,144 +3015,122 @@ jobs:
               );
             }
 
-            Widget _diffQuickChip(int amountVal, String label, QuotexService service) {
-              final selected = (_diffController.text.trim() == amountVal.toString());
-              return GestureDetector(
-                onTap: () {
-                  setState(() => _diffController.text = amountVal.toString());
-                  _syncSettings(service);
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: selected ? const Color(0xFF2563EB) : const Color(0xFF0B0F19),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: selected ? const Color(0xFF60A5FA) : Colors.white12,
+            Widget _geminiPanel(bool hasKey) {
+              return Panel(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.auto_awesome_rounded, color: C.blue, size: 20),
+                        const SizedBox(width: 8),
+                        const Text('Gemini', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        const Spacer(),
+                        _Tag(hasKey ? 'المفتاح مضمّن' : 'بدون مفتاح', hasKey ? C.green : C.amber),
+                      ],
                     ),
-                  ),
-                  child: Text(
-                    label,
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-                      color: selected ? Colors.white : Colors.white70,
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _gKey,
+                      obscureText: true,
+                      decoration: _deco(hasKey ? 'مفتاح جديد (اتركه فارغاً للإبقاء على الحالي)' : 'مفتاح API'),
                     ),
-                  ),
+                    const SizedBox(height: 10),
+                    TextField(controller: _gModel, decoration: _deco('اسم النموذج')),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('اشترط موافقة Gemini قبل كل صفقة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                      subtitle: const Text('يضيف ثواني من الانتظار قبل التنفيذ', style: TextStyle(color: C.dim, fontSize: 12)),
+                      value: _gGate,
+                      onChanged: (v) => setState(() => _gGate = v),
+                    ),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: () {
+                          final k = _gKey.text.trim();
+                          context.read<QuotexService>().setGemini(key: k.isEmpty ? null : k, model: _gModel.text.trim(), gate: _gGate);
+                          _gKey.clear();
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('تم الحفظ على هذا الجهاز')));
+                        },
+                        child: const Text('حفظ'),
+                      ),
+                    ),
+                  ],
                 ),
               );
             }
 
-            Widget _strengthChip(int pct, String label) {
-              final selected = _selectedMinStrength == pct;
-              return GestureDetector(
-                onTap: () {
-                  setState(() => _selectedMinStrength = pct);
-                  _syncSettings(context.read<QuotexService>());
+            Widget _dropdown(String label, String value, Map<String, String> items, ValueChanged<String> onChanged) {
+              return DropdownButtonFormField<String>(
+                value: value,
+                isExpanded: true,
+                dropdownColor: C.card,
+                decoration: _deco(label),
+                items: [for (final e in items.entries) DropdownMenuItem(value: e.key, child: Text(e.value))],
+                onChanged: (v) {
+                  if (v != null) onChanged(v);
                 },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                  decoration: BoxDecoration(
-                    color: selected ? const Color(0xFF10B981) : const Color(0xFF0B0F19),
-                    borderRadius: BorderRadius.circular(9),
-                    border: Border.all(
-                      color: selected ? const Color(0xFF34D399) : Colors.white12,
-                    ),
-                  ),
-                  child: Text(
-                    label,
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-                      color: selected ? Colors.white : Colors.white70,
-                    ),
-                  ),
-                ),
               );
             }
 
-            Widget _accountSegmentButton({
-              required String title,
-              required bool selected,
-              required Color activeColor,
-              required VoidCallback onTap,
-            }) {
+            Widget _num(String label, TextEditingController c) {
+              return TextField(
+                controller: c,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: _deco(label),
+                onChanged: (_) => _sync(),
+              );
+            }
+
+            InputDecoration _deco(String label) {
+              return InputDecoration(
+                labelText: label,
+                filled: true,
+                fillColor: C.field,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: C.line)),
+                enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: C.line)),
+              );
+            }
+
+            Widget _chip(String text, bool selected, Color color, VoidCallback onTap) {
               return GestureDetector(
                 onTap: onTap,
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                   decoration: BoxDecoration(
-                    color: selected ? activeColor : Colors.transparent,
-                    borderRadius: BorderRadius.circular(9),
-                  ),
-                  child: Text(
-                    title,
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-                      color: selected ? Colors.white : Colors.white60,
-                    ),
-                  ),
-                ),
-              );
-            }
-
-            Widget _metricCard({
-              required String title,
-              required String value,
-              required IconData icon,
-              required Color color,
-            }) {
-              return Container(
-                padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF111827),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: Column(
-                  children: [
-                    Icon(icon, color: color, size: 20),
-                    const SizedBox(height: 6),
-                    Text(
-                      value,
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: color),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      title,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 10, color: Colors.white60),
-                    ),
-                  ],
-                ),
-              );
-            }
-
-            Widget _durationChip(int seconds, String label) {
-              final selected = _selectedDuration == seconds;
-              return GestureDetector(
-                onTap: () {
-                  setState(() => _selectedDuration = seconds);
-                  _syncSettings(context.read<QuotexService>());
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: selected ? const Color(0xFF2563EB) : const Color(0xFF0B0F19),
+                    color: selected ? color : C.field,
                     borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: selected ? const Color(0xFF60A5FA) : Colors.white12,
-                    ),
+                    border: Border.all(color: selected ? color : C.line),
                   ),
-                  child: Text(
-                    label,
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-                      color: selected ? Colors.white : Colors.white70,
-                    ),
-                  ),
+                  child: Text(text, style: TextStyle(fontSize: 12.5, fontWeight: selected ? FontWeight.w800 : FontWeight.w500)),
+                ),
+              );
+            }
+          }
+
+          // ───────────────────────── السجل (قائمة كسولة بدون تداخل تمرير) ─────────────────────────
+          class LogsTab extends StatelessWidget {
+            const LogsTab({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              final n = context.select<QuotexService, (int, String)>(
+                (s) => (s.logs.length, s.logs.isEmpty ? '' : s.logs.first),
+              );
+              final logs = context.read<QuotexService>().logs;
+              if (n.$1 == 0) {
+                return const Center(child: Text('لا توجد أحداث بعد…', style: TextStyle(color: C.dim)));
+              }
+              return ListView.builder(
+                padding: const EdgeInsets.all(14),
+                itemCount: logs.length,
+                itemBuilder: (_, i) => Container(
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: C.card, borderRadius: BorderRadius.circular(12), border: Border.all(color: C.line)),
+                  child: Text(logs[i], style: const TextStyle(color: Color(0xFF6EE7B7), fontSize: 12, height: 1.4)),
                 ),
               );
             }
@@ -2999,5 +3152,5 @@ jobs:
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: QuMatix-App-APK
+          name: Hussam-AI-APK
           path: build/app/outputs/flutter-apk/app-release.apk
