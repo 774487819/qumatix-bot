@@ -231,7 +231,7 @@ jobs:
             for (final sym in ts.keys) {
               final t = ts[sym]!;
               final p = px[sym]!;
-              if (p.length < 300) continue;
+              if (p.length < 200) continue;
               final X = <List<double>>[];
               final y = <double>[];
               int j = 0;
@@ -249,14 +249,14 @@ jobs:
                 X.add(f);
                 y.add(p[j] > p[i] ? 1.0 : 0.0);
               }
-              if (y.length < 150) continue;
+              if (y.length < 100) continue;
               final n = (y.length * 0.7).floor();
               trX.addAll(X.sublist(0, n));
               trY.addAll(y.sublist(0, n));
               teX.addAll(X.sublist(n));
               teY.addAll(y.sublist(n));
             }
-            if (trY.length < 500 || teY.length < 200) {
+            if (trY.length < 400 || teY.length < 150) {
               return jsonEncode({'ok': false, 'reason': 'تم جمع ${trY.length + teY.length} عينة فقط'});
             }
             final nf = trX.first.length;
@@ -332,6 +332,9 @@ jobs:
             static const String _defaultGeminiKey = String.fromEnvironment('GEMINI_API_KEY', defaultValue: 'AQ.Ab8RN6L04To4_9jkRYxmpP8DVg-4m93GRMqVU55Wqw4yTqWE8Q');
             String _geminiKey = _defaultGeminiKey;
             bool _collectEnabled = false;
+            int _otcKnown = 0;
+            bool _collectBurstPending = false;
+            bool _bursting = false;
             bool _training = false;
             String _modelInfo = 'لم يُدرَّب بعد';
             int _dataBytes = 0;
@@ -534,31 +537,43 @@ jobs:
 
             Future<void> setCollect(bool v) async {
               _collectEnabled = v;
+              _collectBurstPending = v;
               try {
                 final p = await SharedPreferences.getInstance();
                 await p.setBool('collect_otc', v);
               } catch (_) {}
-              addLog(v ? "بدأ جمع أسعار OTC من سيرفر Quotex (يدور على الأزواج أثناء عدم وجود صفقات)" : "توقف جمع الأسعار");
+              addLog(v ? "بدأ جمع أسعار كل أزواج OTC من سيرفر Quotex (اشتراك جماعي كل 5 دقائق أثناء عدم وجود صفقات)" : "توقف جمع الأسعار");
             }
-
-            void _cycleCollector() {
-              if (_webViewController == null || !_isConnected) return;
-              final sym = toServerSymbol(otcPairs[_collectCursor % otcPairs.length]);
-              _collectCursor++;
+            void _burstSubscribeAll() {
+              if (_webViewController == null || !_isConnected || _bursting) return;
+              _bursting = true;
+              final fallback = jsonEncode(otcPairs.map(toServerSymbol).toList());
               _webViewController!.evaluateJavascript(source: '''
                 (function() {
                   try {
+                    const list = (window.__qm_otc_syms && window.__qm_otc_syms.length > 0) ? window.__qm_otc_syms : $fallback;
+                    let ws = null;
                     if (window.__qm_sockets) {
-                      for (let i = 0; i < window.__qm_sockets.length; i++) {
-                        const ws = window.__qm_sockets[i];
-                        if (ws && ws.readyState === 1) {
-                          ws.send('42["instruments/update",{"asset":"$sym","period":$_tradeDuration}]');
-                        }
+                      for (let i = window.__qm_sockets.length - 1; i >= 0; i--) {
+                        if (window.__qm_sockets[i] && window.__qm_sockets[i].readyState === 1) { ws = window.__qm_sockets[i]; break; }
                       }
                     }
+                    if (!ws) return;
+                    let n = 0;
+                    function step() {
+                      if (n >= list.length || ws.readyState !== 1) return;
+                      ws.send('42["instruments/update",{"asset":"' + list[n] + '","period":$_tradeDuration}]');
+                      n++;
+                      setTimeout(step, 250);
+                    }
+                    step();
                   } catch(e) {}
                 })();
               ''');
+              Future.delayed(const Duration(seconds: 70), () {
+                _bursting = false;
+                _subscribeServerToAsset(activeAsset);
+              });
             }
 
             void _ingestTicks(List raw) {
@@ -598,10 +613,15 @@ jobs:
 
             Future<void> trainModelNow() async {
               if (_training) return;
+                  await _flushTicks();
+              if (_dataBytes < 60000) {
+                _modelInfo = 'البيانات قليلة (${(_dataBytes / 1024).toStringAsFixed(0)} KB). اترك الجمع يعمل ساعة على الأقل ثم أعد المحاولة';
+                notifyListeners();
+                return;
+              }
               _training = true;
               notifyListeners();
               try {
-                await _flushTicks();
                 final dir = await _ensureDir();
                 if (dir == null) throw 'تعذر الوصول لمجلد التطبيق';
                 final out = await compute(_trainOtcModelSync, <String, dynamic>{
@@ -623,7 +643,6 @@ jobs:
                   }
                 } else {
                   _modelInfo = 'البيانات غير كافية بعد: ${j['reason'] ?? ''}';
-                  addLog("التدريب: $_modelInfo");
                 }
               } catch (e) {
                 _modelInfo = 'فشل التدريب';
@@ -670,19 +689,28 @@ jobs:
                       'momentum=${_priceMomentum.toStringAsFixed(6)}, crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, '
                       'trainedModelProbUp=${_modelProb?.toStringAsFixed(3) ?? "n/a"}, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
                       'last30Prices=${recent.join(",")}';
-                  final req = await client.postUrl(Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$_geminiModel:generateContent'));
-                  req.headers.set('Content-Type', 'application/json');
-                  req.headers.set('x-goog-api-key', _geminiKey);
+                  final bool vertex = _geminiKey.startsWith('AQ.');
+                final uri = vertex
+          ? Uri.parse('https://aiplatform.googleapis.com/v1/publishers/google/models/$_geminiModel:generateContent?key=$_geminiKey')
+          : Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$_geminiModel:generateContent');
+                final req = await client.postUrl(uri);
+                req.headers.set('Content-Type', 'application/json');
+                if (!vertex) req.headers.set('x-goog-api-key', _geminiKey);
                   req.add(utf8.encode(jsonEncode({
                     'contents': [
-                      {'parts': [{'text': prompt}]}
+          {'role': 'user', 'parts': [{'text': prompt}]}
                     ],
                     'generationConfig': {'temperature': 0.2, 'responseMimeType': 'application/json'},
                   })));
                   final res = await req.close().timeout(const Duration(seconds: 20));
                   final body = await res.transform(utf8.decoder).join();
                   if (res.statusCode != 200) {
-                    addLog("Gemini: رفض الطلب (رمز ${res.statusCode}) تحقق من المفتاح واسم النموذج");
+                    String detail = '';
+                  try {
+          detail = (jsonDecode(body)['error']['message'] ?? '').toString();
+                  } catch (_) {}
+                  if (detail.length > 140) detail = detail.substring(0, 140);
+                  addLog("Gemini: رفض الطلب (رمز ${res.statusCode}) $detail");
                     _geminiDir = '';
                   } else {
                     final j = jsonDecode(body);
@@ -915,22 +943,22 @@ jobs:
             Future<void> _subscribeServerToAsset(String displayAsset) async {
               final target = displayAsset == "AUTO_CHART" ? _chartDisplayPair : displayAsset;
               final sym = toServerSymbol(target);
-              final baseSym = sym.replaceAll('_otc', '');
-
               if (_webViewController != null) {
                 try {
                   await _webViewController!.evaluateJavascript(source: '''
                     (function() {
                       try {
+                        const rs = window.__qm_resolve ? window.__qm_resolve('$target', '$sym') : '$sym';
+                        const rb = rs.replace('_otc', '');
                         if (window.__qm_sockets && window.__qm_sockets.length > 0) {
                           for (let i = 0; i < window.__qm_sockets.length; i++) {
                             const ws = window.__qm_sockets[i];
                             if (ws && ws.readyState === 1) {
-                              ws.send('42["instruments/update",{"asset":"$sym","period":$_tradeDuration}]');
-                              ws.send('42["depth/follow","$sym"]');
-                              ws.send('42["chart_notification/get",{"asset":"$sym","version":"1.0.0"}]');
-                              ws.send('42["instruments/update",{"asset":"$baseSym","period":$_tradeDuration}]');
-                              ws.send('42["depth/follow","$baseSym"]');
+                              ws.send('42["instruments/update",{"asset":"' + rs + '","period":$_tradeDuration}]');
+                              ws.send('42["depth/follow","' + rs + '"]');
+                              ws.send('42["chart_notification/get",{"asset":"' + rs + '","version":"1.0.0"}]');
+                              ws.send('42["instruments/update",{"asset":"' + rb + '","period":$_tradeDuration}]');
+                              ws.send('42["depth/follow","' + rb + '"]');
                             }
                           }
                         }
@@ -964,10 +992,11 @@ jobs:
               _webSyncTimer = Timer.periodic(const Duration(milliseconds: 800), (_) async {
                 if (!_isConnected || _webViewController == null) return;
                 tickCounter++;
-                final bool cycling = _collectEnabled && !_isAutoTrading && !_isTradeOpen;
-                if (cycling) {
-                  if (tickCounter % 19 == 0) _cycleCollector();
-                } else if (tickCounter % 6 == 0) {
+                final bool collectIdle = _collectEnabled && !_isAutoTrading && !_isTradeOpen;
+                if (collectIdle && (_collectBurstPending || tickCounter % 375 == 0) && !_bursting) {
+                  _collectBurstPending = false;
+                  _burstSubscribeAll();
+                } else if (!_bursting && tickCounter % 6 == 0) {
                   _subscribeServerToAsset(activeAsset);
                 }
 
@@ -1028,7 +1057,8 @@ jobs:
                           return String(s || '').replace('(OTC)', 'OTC').replace('_otc', 'OTC').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
                         }
 
-                        const k1 = ('$_selectedAsset' === 'AUTO_CHART' && chartPair) ? norm(chartPair) : '$wantedNorm';
+                        let k1 = ('$_selectedAsset' === 'AUTO_CHART' && chartPair) ? norm(chartPair) : '$wantedNorm';
+                        if (window.__qm_name_to_symkey && window.__qm_name_to_symkey[k1]) k1 = window.__qm_name_to_symkey[k1];
                         const k2 = '$baseNorm';
                         let activeKeyUsed = k1;
                         let prices = [];
@@ -1068,7 +1098,8 @@ jobs:
                           prices: prices.slice(-100),
                           minCall: Math.round(minCall),
                           minPut: Math.round(minPut),
-                          ticks: (window.__qm_tick_buf ? window.__qm_tick_buf.splice(0, window.__qm_tick_buf.length) : [])
+                          ticks: (window.__qm_tick_buf ? window.__qm_tick_buf.splice(0, window.__qm_tick_buf.length) : []),
+                          otc: (window.__qm_otc_syms ? window.__qm_otc_syms.length : 0)
                         });
                       } catch(e) { return '{}'; }
                     })();
@@ -1096,6 +1127,11 @@ jobs:
                       }
 
                       final rawTicks = map['ticks'];
+                      final oc = map['otc'];
+                      if (oc is int && oc != _otcKnown) {
+                        if (_otcKnown == 0 && oc > 0) addLog("تم التعرف على $oc زوج OTC من قائمة سيرفر Quotex ✔");
+                        _otcKnown = oc;
+                      }
                       if (rawTicks is List && rawTicks.isNotEmpty) _ingestTicks(rawTicks);
 
                       final rawPrices = map['prices'];
@@ -1535,7 +1571,7 @@ jobs:
               final execRes = await _webViewController!.evaluateJavascript(source: '''
                 (function() {
                   try {
-                    const assetSym = '$serverSym';
+                    const assetSym = (window.__qm_resolve ? window.__qm_resolve('$targetPair', '$serverSym') : '$serverSym');
                     const amt = Number('$cleanAmount');
                     const dir = ${isCall ? "'call'" : "'put'"};
                     const dur = $duration;
@@ -1547,6 +1583,7 @@ jobs:
                     const expClockTimestamp = (Math.floor(nowSec / 60) + addMin) * 60;
 
                     window.__qm_last_order_accepted = false;
+                    window.__qm_last_srv_msg = '';
                     window.__qm_last_deal_profit = null;
 
                     let activeWs = null;
@@ -1621,7 +1658,7 @@ jobs:
                       activeWs.send('42["orders/open",' + JSON.stringify(order1) + ']');
                     }
 
-                    return 'WS_ORDER_DISPATCHED';
+                    return 'WS_ORDER_DISPATCHED:' + assetSym;
                   } catch(e) {
                     return 'ERR:' + e.message;
                   }
@@ -1630,6 +1667,26 @@ jobs:
 
               if (execRes == null || execRes.toString().contains("NO_OPEN_SOCKET") || execRes.toString().contains("ERR:")) {
                 addLog("⚠ لم يتم العثور على قناة WebSocket نشطة (${execRes ?? ''}) — اضغط على تبويب المنصة والشارت لتنشيط الاتصال.");
+                return;
+              }
+
+              final String usedSym = execRes.toString().contains(':') ? execRes.toString().split(':').last : serverSym;
+              String? rejectMsg;
+              for (int i = 0; i < 8; i++) {
+                await Future.delayed(const Duration(milliseconds: 400));
+                try {
+                  final chk = await _webViewController!.evaluateJavascript(source: "JSON.stringify({ok: !!window.__qm_last_order_accepted, msg: window.__qm_last_srv_msg || ''})");
+                  final cm = jsonDecode(chk.toString());
+                  if (cm['ok'] == true) {
+                    rejectMsg = null;
+                    break;
+                  }
+                  final mm = (cm['msg'] ?? '').toString();
+                  if (mm.isNotEmpty) rejectMsg = mm;
+                } catch (_) {}
+              }
+              if (rejectMsg != null) {
+                addLog("❌ رفض السيرفر الصفقة على $targetPair ($usedSym): $rejectMsg");
                 return;
               }
 
@@ -1643,7 +1700,7 @@ jobs:
               _totalTrades++;
               notifyListeners();
 
-              addLog("🚀 تم تنفيذ صفقة ${direction.toUpperCase()} مباشرة عبر السيرفر على $targetPair ($serverSym) بمبلغ \$$cleanAmount");
+              addLog("🚀 تم تنفيذ صفقة ${direction.toUpperCase()} مباشرة عبر السيرفر على $targetPair ($usedSym) بمبلغ \$$cleanAmount");
 
               _tradeLifecycleTimer?.cancel();
               _tradeLifecycleTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
@@ -1779,6 +1836,32 @@ jobs:
                 window.__qm_avg_step_by_key = {};
                 window.__qm_tick_buf = [];
                 window.__qm_last_otc = {};
+                window.__qm_sym_by_name = {};
+                window.__qm_name_to_symkey = {};
+                window.__qm_otc_syms = [];
+                window.__qm_last_srv_msg = '';
+                window.__qm_resolve = function(display, fallback) {
+                  try {
+                    var k = normKey(display);
+                    return window.__qm_sym_by_name[k] || fallback;
+                  } catch (e) { return fallback; }
+                };
+                function registerInstruments(list) {
+                  try {
+                    for (var i = 0; i < list.length; i++) {
+                      var it = list[i];
+                      if (!Array.isArray(it) || it.length < 3) return false;
+                      var sym = it[1], name = it[2];
+                      if (typeof sym !== 'string' || typeof name !== 'string') return false;
+                      if (sym.toLowerCase().indexOf('_otc') === -1) continue;
+                      var nk = normKey(name);
+                      window.__qm_sym_by_name[nk] = sym;
+                      window.__qm_name_to_symkey[nk] = normKey(sym);
+                      if (window.__qm_otc_syms.indexOf(sym) === -1) window.__qm_otc_syms.push(sym);
+                    }
+                    return true;
+                  } catch (e) { return false; }
+                }
 
                 function logTick(asset, ts, price) {
                   try {
@@ -1852,6 +1935,9 @@ jobs:
                 function scanJsonForTicks(node) {
                   if (!node) return;
                   if (Array.isArray(node)) {
+                    if (node.length > 0 && Array.isArray(node[0]) && node[0].length >= 3 && typeof node[0][1] === 'string' && typeof node[0][2] === 'string') {
+                      if (registerInstruments(node)) return;
+                    }
                     // صيغة البث الحي المباشر من السيرفر: ["EURUSD_otc", 1728918015.2, 1.08542, 0]
                     if (node.length >= 3 && typeof node[0] === 'string' && typeof node[1] === 'number' && typeof node[2] === 'number') {
                       if (node[1] > 1500000000 && node[2] > 0) {
@@ -1909,6 +1995,7 @@ jobs:
                 function handleRawText(txt) {
                   if (!txt || typeof txt !== 'string' || txt.length < 4) return;
                   try {
+                    if (txt.length < 800 && txt.toLowerCase().indexOf('error') !== -1) window.__qm_last_srv_msg = txt.substring(0, 300);
                     if (txt.indexOf('"openPrice"') !== -1 && txt.indexOf('"id"') !== -1) {
                       window.__qm_last_order_accepted = true;
                     }
@@ -2317,7 +2404,7 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'Hussam AI',
+                title: 'QuMatix Pro AI',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData.dark(useMaterial3: true).copyWith(
                   scaffoldBackgroundColor: C.bg,
@@ -2366,7 +2453,7 @@ jobs:
                         child: const Icon(Icons.bolt_rounded, color: Colors.white, size: 20),
                       ),
                       const SizedBox(width: 10),
-                      const Text('Hussam AI', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
+                      const Text('QuMatix Pro', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
                     ],
                   ),
                   actions: const [_ConnectionChip(), SizedBox(width: 14)],
@@ -2854,7 +2941,7 @@ jobs:
               'platform_interest_contrarian': 'رادار السيولة',
               'hybrid_ai_contrarian': 'مدمج (رادار + مؤشرات)',
               'local_deep_ai': 'محرك المؤشرات',
-              'qumatix_rsi_ema': 'RSI + EMA',
+              'qumatix_rsi_ema': 'QuMatix',
               'trend_momentum': 'Trend Pro',
               'reversal_sniper': 'Sniper',
             };
@@ -2999,7 +3086,7 @@ jobs:
                       value: r.$1,
                       onChanged: (v) => context.read<QuotexService>().setCollect(v),
                     ),
-                    Text('${r.$3.toStringAsFixed(1)} MB مخزّنة • ${r.$4} زوجاً في هذه الجلسة', style: const TextStyle(color: C.dim, fontSize: 12)),
+                    Text('${r.$3 < 1 ? '${(r.$3 * 1024).toStringAsFixed(0)} KB' : '${r.$3.toStringAsFixed(1)} MB'} مخزّنة (≈ ${(r.$3 * 1048576 / 30).round()} سعر) • ${r.$4} زوجاً في هذه الجلسة', style: const TextStyle(color: C.dim, fontSize: 12)),
                     const SizedBox(height: 4),
                     Text(r.$5, style: const TextStyle(color: C.dim, fontSize: 12, height: 1.5)),
                     const SizedBox(height: 10),
