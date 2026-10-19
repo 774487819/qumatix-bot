@@ -329,8 +329,12 @@ jobs:
             bool _aiTensorLoaded = false;
             _TrainedModel? _model;
             double? _modelProb;
-            static const String _defaultGeminiKey = String.fromEnvironment('GEMINI_API_KEY', defaultValue: 'AQ.Ab8RN6L04To4_9jkRYxmpP8DVg-4m93GRMqVU55Wqw4yTqWE8Q');
+            static const String _defaultGeminiKey = String.fromEnvironment('GEMINI_API_KEY', defaultValue: '');
             String _geminiKey = _defaultGeminiKey;
+            String _aiProv = '';
+            String _aiName = '';
+            bool _aiDetecting = false;
+            bool _modelManual = false;
             bool _collectEnabled = false;
             int _otcKnown = 0;
             bool _collectBurstPending = false;
@@ -509,6 +513,9 @@ jobs:
                 if (k != null && k.isNotEmpty) _geminiKey = k;
                 _geminiModel = p.getString('gemini_model') ?? _geminiModel;
                 _geminiGate = p.getBool('gemini_gate') ?? false;
+              _aiProv = p.getString('ai_prov') ?? '';
+              _aiName = p.getString('ai_name') ?? '';
+              _modelManual = p.getBool('ai_manual') ?? false;
                 _collectEnabled = p.getBool('collect_otc') ?? false;
               } catch (_) {}
               try {
@@ -653,18 +660,162 @@ jobs:
               }
             }
 
-              Future<void> setGemini({String? key, String? model, bool? gate}) async {
-                if (key != null) _geminiKey = key;
-                if (model != null && model.isNotEmpty) _geminiModel = model;
-                if (gate != null) _geminiGate = gate;
-                try {
-                  final p = await SharedPreferences.getInstance();
-                  await p.setString('gemini_key', _geminiKey);
-                  await p.setString('gemini_model', _geminiModel);
-                  await p.setBool('gemini_gate', _geminiGate);
-                } catch (_) {}
+              static const List<Map<String, String>> _providers = [
+              {'id': 'gemini', 'name': 'Google Gemini', 'base': 'https://generativelanguage.googleapis.com/v1beta', 'prefix': 'AIza'},
+              {'id': 'vertex', 'name': 'Google Vertex AI', 'base': 'https://aiplatform.googleapis.com/v1', 'prefix': 'AQ.'},
+              {'id': 'anthropic', 'name': 'Anthropic Claude', 'base': 'https://api.anthropic.com/v1', 'prefix': 'sk-ant-'},
+              {'id': 'openrouter', 'name': 'OpenRouter', 'base': 'https://openrouter.ai/api/v1', 'prefix': 'sk-or-'},
+              {'id': 'groq', 'name': 'Groq', 'base': 'https://api.groq.com/openai/v1', 'prefix': 'gsk_'},
+              {'id': 'xai', 'name': 'xAI Grok', 'base': 'https://api.x.ai/v1', 'prefix': 'xai-'},
+              {'id': 'cerebras', 'name': 'Cerebras', 'base': 'https://api.cerebras.ai/v1', 'prefix': 'csk-'},
+              {'id': 'perplexity', 'name': 'Perplexity', 'base': 'https://api.perplexity.ai', 'prefix': 'pplx-'},
+              {'id': 'openai', 'name': 'OpenAI', 'base': 'https://api.openai.com/v1', 'prefix': 'sk-'},
+              {'id': 'deepseek', 'name': 'DeepSeek', 'base': 'https://api.deepseek.com', 'prefix': 'sk-'},
+              {'id': 'mistral', 'name': 'Mistral', 'base': 'https://api.mistral.ai/v1', 'prefix': ''},
+            ];
+
+            String get aiName => _aiName;
+            bool get aiDetecting => _aiDetecting;
+
+            Future<(int, String)> _httpCall(String method, String url, Map<String, String> headers, [String? body]) async {
+              final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+              try {
+                final req = method == 'GET' ? await client.getUrl(Uri.parse(url)) : await client.postUrl(Uri.parse(url));
+                headers.forEach((k, v) => req.headers.set(k, v));
+                if (body != null) req.add(utf8.encode(body));
+                final res = await req.close().timeout(const Duration(seconds: 20));
+                return (res.statusCode, await res.transform(utf8.decoder).join());
+              } finally {
+                client.close();
+              }
+            }
+
+            Map<String, String> _aiHeaders(String id, String key) {
+              if (id == 'gemini') return {'x-goog-api-key': key};
+              if (id == 'anthropic') return {'x-api-key': key, 'anthropic-version': '2023-06-01'};
+              return {'Authorization': 'Bearer $key'};
+            }
+
+            List<Map<String, String>> _candidatesFor(String key) {
+              final matched = <Map<String, String>>[];
+              for (final p in _providers) {
+                final pre = p['prefix']!;
+                if (pre.isNotEmpty && pre != 'sk-' && key.startsWith(pre)) matched.add(p);
+              }
+              if (matched.isNotEmpty) return matched;
+              if (key.startsWith('sk-')) {
+                return _providers.where((p) => p['id'] == 'openai' || p['id'] == 'deepseek').toList();
+              }
+              return _providers.where((p) => p['id'] != 'perplexity').toList();
+            }
+
+            Future<List<String>?> _probe(Map<String, String> p, String key) async {
+              final id = p['id']!;
+              final base = p['base']!;
+              try {
+                if (id == 'vertex') {
+                  final r = await _httpCall('POST', '$base/publishers/google/models/gemini-2.5-flash:generateContent?key=$key', {'Content-Type': 'application/json'},
+                      jsonEncode({'contents': [{'role': 'user', 'parts': [{'text': 'hi'}]}], 'generationConfig': {'maxOutputTokens': 5}}));
+                  return r.$1 == 200 ? <String>['gemini-2.5-flash'] : null;
+                }
+                if (id == 'perplexity') return <String>['sonar'];
+                final r = await _httpCall('GET', '$base/models', _aiHeaders(id, key));
+                if (r.$1 != 200) return null;
+                final j = jsonDecode(r.$2);
+                if (id == 'gemini') {
+                  return [
+                    for (final m in (j['models'] as List))
+                      if (((m['supportedGenerationMethods'] as List?) ?? const ['generateContent']).contains('generateContent'))
+                        (m['name'] as String).replaceFirst('models/', '')
+                  ];
+                }
+                return [for (final m in (j['data'] as List)) m['id'].toString()];
+              } catch (_) {
+                return null;
+              }
+            }
+
+            String _pickModel(String id, List<String> all) {
+              final ids = all.where((m) {
+                final l = m.toLowerCase();
+                return !(l.contains('embed') || l.contains('whisper') || l.contains('tts') || l.contains('guard') || l.contains('moderation') || l.contains('imagen') || l.contains('veo') || l.contains('audio') || l.contains('image'));
+              }).toList();
+              const pref = {
+                'gemini': ['gemini-2.5-flash', 'flash-latest', 'flash', 'gemini'],
+                'vertex': ['gemini-2.5-flash'],
+                'anthropic': ['sonnet', 'haiku', 'claude'],
+                'openai': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-5-mini', 'gpt-4o', 'gpt'],
+                'groq': ['llama-3.3-70b', 'llama', ''],
+                'openrouter': [':free', 'gpt-4o-mini', ''],
+                'xai': ['grok', ''],
+                'cerebras': ['llama', ''],
+                'deepseek': ['deepseek-chat', ''],
+                'mistral': ['mistral-small', 'mistral-medium', 'mistral', ''],
+                'perplexity': ['sonar'],
+              };
+              for (final k in (pref[id] ?? const [''])) {
+                final hit = ids.where((m) => k.isEmpty || m.contains(k)).toList();
+                if (hit.isNotEmpty) return hit.first;
+              }
+              return ids.isNotEmpty ? ids.first : (all.isNotEmpty ? all.first : '');
+            }
+
+            Future<void> _saveAiPrefs() async {
+              try {
+                final p = await SharedPreferences.getInstance();
+                await p.setString('gemini_key', _geminiKey);
+                await p.setString('gemini_model', _geminiModel);
+                await p.setBool('gemini_gate', _geminiGate);
+                await p.setString('ai_prov', _aiProv);
+                await p.setString('ai_name', _aiName);
+                await p.setBool('ai_manual', _modelManual);
+              } catch (_) {}
+            }
+
+            Future<bool> _detectAi() async {
+              if (_geminiKey.isEmpty) return false;
+              _aiDetecting = true;
+              notifyListeners();
+              try {
+                for (final p in _candidatesFor(_geminiKey)) {
+                  final ids = await _probe(p, _geminiKey);
+                  if (ids != null) {
+                    _aiProv = p['id']!;
+                    _aiName = p['name']!;
+                    if (!_modelManual) _geminiModel = _pickModel(_aiProv, ids);
+                    await _saveAiPrefs();
+                    addLog("تم التعرف على المفتاح: $_aiName • النموذج: $_geminiModel");
+                    return true;
+                  }
+                }
+                _aiProv = '';
+                _aiName = '';
+                addLog("لم أتمكن من التعرف على المفتاح: رفضه كل المزوّدين المحتملين، تأكد من نسخه كاملاً");
+                return false;
+              } finally {
+                _aiDetecting = false;
                 notifyListeners();
               }
+            }
+
+            Future<void> setGemini({String? key, String? model, bool? gate}) async {
+              if (gate != null) _geminiGate = gate;
+              if (model != null) {
+                final mm = model.trim();
+                _modelManual = mm.isNotEmpty && mm.toLowerCase() != 'auto';
+                if (_modelManual) _geminiModel = mm;
+              }
+              if (key != null && key.isNotEmpty) {
+                _geminiKey = key;
+                _aiProv = '';
+                _aiName = '';
+              }
+              await _saveAiPrefs();
+              notifyListeners();
+              if ((key != null && key.isNotEmpty) || (_geminiKey.isNotEmpty && _aiProv.isEmpty)) {
+                await _detectAi();
+              }
+            }
 
               bool get hasGeminiKey => _geminiKey.isNotEmpty;
               bool get geminiBusy => _geminiBusy;
@@ -675,69 +826,79 @@ jobs:
               String get geminiModel => _geminiModel;
 
               Future<void> askGemini() async {
-                if (_geminiKey.isEmpty || _geminiBusy) return;
-                _geminiBusy = true;
-                notifyListeners();
-                final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
-                try {
-                  final recent = _priceHistory.length > 30 ? _priceHistory.sublist(_priceHistory.length - 30) : _priceHistory;
-                  final prompt = 'You are a cautious market analyst for a 1-minute binary option. Use ONLY the data below. '
-                      'Reply with strict JSON: {"direction":"CALL|PUT|WAIT","confidence":0-100,"reason":"one short Arabic sentence"}. '
-                      'Answer WAIT when the data is unclear. Data: asset=$activeAsset, lastPrice=$_lastPrice, '
-                      'ema5=${_ema5.toStringAsFixed(6)}, ema13=${_ema13.toStringAsFixed(6)}, rsi14=${_currentRsi.toStringAsFixed(1)}, '
-                      'macdHist=${_macdHistogram.toStringAsFixed(6)}, stochK=${_stochasticK.toStringAsFixed(1)}, cci=${_cci14.toStringAsFixed(1)}, '
-                      'momentum=${_priceMomentum.toStringAsFixed(6)}, crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, '
-                      'trainedModelProbUp=${_modelProb?.toStringAsFixed(3) ?? "n/a"}, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
-                      'last30Prices=${recent.join(",")}';
-                  final bool vertex = _geminiKey.startsWith('AQ.');
-                final uri = vertex
-          ? Uri.parse('https://aiplatform.googleapis.com/v1/publishers/google/models/$_geminiModel:generateContent?key=$_geminiKey')
-          : Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$_geminiModel:generateContent');
-                final req = await client.postUrl(uri);
-                req.headers.set('Content-Type', 'application/json');
-                if (!vertex) req.headers.set('x-goog-api-key', _geminiKey);
-                  req.add(utf8.encode(jsonEncode({
-                    'contents': [
-          {'role': 'user', 'parts': [{'text': prompt}]}
-                    ],
-                    'generationConfig': {'temperature': 0.2, 'responseMimeType': 'application/json'},
-                  })));
-                  final res = await req.close().timeout(const Duration(seconds: 20));
-                  final body = await res.transform(utf8.decoder).join();
-                  if (res.statusCode != 200) {
-                    String detail = '';
+              if (_geminiKey.isEmpty || _geminiBusy) return;
+              _geminiBusy = true;
+              notifyListeners();
+              try {
+                if (_aiProv.isEmpty && !await _detectAi()) {
+                  _geminiDir = '';
+                  return;
+                }
+                final recent = _priceHistory.length > 30 ? _priceHistory.sublist(_priceHistory.length - 30) : _priceHistory;
+                final prompt = 'You are a cautious market analyst for a 1-minute binary option. Use ONLY the data below. '
+                    'Reply with strict JSON only: {"direction":"CALL|PUT|WAIT","confidence":0-100,"reason":"one short Arabic sentence"}. '
+                    'Answer WAIT when the data is unclear. Data: asset=$activeAsset, lastPrice=$_lastPrice, '
+                    'ema5=${_ema5.toStringAsFixed(6)}, ema13=${_ema13.toStringAsFixed(6)}, rsi14=${_currentRsi.toStringAsFixed(1)}, '
+                    'macdHist=${_macdHistogram.toStringAsFixed(6)}, stochK=${_stochasticK.toStringAsFixed(1)}, cci=${_cci14.toStringAsFixed(1)}, '
+                    'momentum=${_priceMomentum.toStringAsFixed(6)}, crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, '
+                    'trainedModelProbUp=${_modelProb?.toStringAsFixed(3) ?? "n/a"}, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
+                    'last30Prices=${recent.join(",")}';
+                final base = _providers.firstWhere((p) => p['id'] == _aiProv)['base']!;
+                (int, String) r = (0, '');
+                String text = '';
+                if (_aiProv == 'gemini' || _aiProv == 'vertex') {
+                  final url = _aiProv == 'vertex'
+                      ? '$base/publishers/google/models/$_geminiModel:generateContent?key=$_geminiKey'
+                      : '$base/models/$_geminiModel:generateContent';
+                  r = await _httpCall('POST', url, {'Content-Type': 'application/json', if (_aiProv == 'gemini') 'x-goog-api-key': _geminiKey},
+                      jsonEncode({
+                        'contents': [
+                          {'role': 'user', 'parts': [{'text': prompt}]}
+                        ],
+                        'generationConfig': {'temperature': 0.2, 'responseMimeType': 'application/json'},
+                      }));
+                  if (r.$1 == 200) text = jsonDecode(r.$2)['candidates'][0]['content']['parts'][0]['text'] as String;
+                } else if (_aiProv == 'anthropic') {
+                  r = await _httpCall('POST', '$base/messages', {'Content-Type': 'application/json', ..._aiHeaders('anthropic', _geminiKey)},
+                      jsonEncode({'model': _geminiModel, 'max_tokens': 400, 'messages': [{'role': 'user', 'content': prompt}]}));
+                  if (r.$1 == 200) text = jsonDecode(r.$2)['content'][0]['text'] as String;
+                } else {
+                  r = await _httpCall('POST', '$base/chat/completions', {'Content-Type': 'application/json', ..._aiHeaders(_aiProv, _geminiKey)},
+                      jsonEncode({'model': _geminiModel, 'temperature': 0.2, 'messages': [{'role': 'user', 'content': prompt}]}));
+                  if (r.$1 == 200) text = jsonDecode(r.$2)['choices'][0]['message']['content'] as String;
+                }
+                if (r.$1 != 200) {
+                  String detail = '';
                   try {
-          detail = (jsonDecode(body)['error']['message'] ?? '').toString();
+                    detail = (jsonDecode(r.$2)['error']['message'] ?? '').toString();
                   } catch (_) {}
                   if (detail.length > 140) detail = detail.substring(0, 140);
-                  addLog("Gemini: رفض الطلب (رمز ${res.statusCode}) $detail");
-                    _geminiDir = '';
-                  } else {
-                    final j = jsonDecode(body);
-                    final text = j['candidates'][0]['content']['parts'][0]['text'] as String;
-                    final m = jsonDecode(text.replaceAll(RegExp(r'```json|```'), '').trim());
-                    final d = (m['direction'] ?? '').toString().toUpperCase();
-                    _geminiDir = (d == 'CALL' || d == 'PUT') ? d : 'WAIT';
-                    _geminiConf = ((m['confidence'] as num?) ?? 0).round().clamp(0, 100);
-                    _geminiReason = (m['reason'] ?? '').toString();
-                  }
-                } catch (_) {
-                  addLog("Gemini: تعذر الاتصال أو قراءة الرد");
+                  addLog("$_aiName: رفض الطلب (رمز ${r.$1}) $detail");
                   _geminiDir = '';
-                } finally {
-                  client.close();
-                  _geminiBusy = false;
-                  notifyListeners();
+                } else {
+                  final jsonText = RegExp(r'\{[\s\S]*\}').firstMatch(text)?.group(0) ?? text;
+                  final m = jsonDecode(jsonText);
+                  final d = (m['direction'] ?? '').toString().toUpperCase();
+                  _geminiDir = (d == 'CALL' || d == 'PUT') ? d : 'WAIT';
+                  _geminiConf = ((m['confidence'] as num?) ?? 0).round().clamp(0, 100);
+                  _geminiReason = (m['reason'] ?? '').toString();
                 }
+              } catch (_) {
+                addLog("الذكاء الاصطناعي: تعذر الاتصال أو قراءة الرد");
+                _geminiDir = '';
+              } finally {
+                _geminiBusy = false;
+                notifyListeners();
               }
+            }
 
               Future<bool> _geminiApproves(String dir) async {
                 if (!_geminiGate || _geminiKey.isEmpty) return true;
                 await askGemini();
                 final ok = _geminiDir == dir.toUpperCase() && _geminiConf >= 60;
                 addLog(ok
-                    ? "Gemini وافق على ${dir.toUpperCase()} ($_geminiConf%)"
-                    : "Gemini لم يوافق (${_geminiDir.isEmpty ? 'لا رد' : _geminiDir} $_geminiConf%) وتم تخطي هذه الدقيقة");
+                    ? "الذكاء الاصطناعي وافق على ${dir.toUpperCase()} ($_geminiConf%)"
+                    : "الذكاء الاصطناعي لم يوافق (${_geminiDir.isEmpty ? 'لا رد' : _geminiDir} $_geminiConf%) وتم تخطي هذه الدقيقة");
                 return ok;
               }            bool get isConnected => _isConnected;
             bool get isAuthenticated => _isAuthenticated;
@@ -2724,8 +2885,8 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              final r = context.select<QuotexService, (bool, bool, String, int, String)>(
-                (s) => (s.hasGeminiKey, s.geminiBusy, s.geminiDir, s.geminiConf, s.geminiReason),
+              final r = context.select<QuotexService, (bool, bool, String, int, String, String)>(
+                (s) => (s.hasGeminiKey, s.geminiBusy, s.geminiDir, s.geminiConf, s.geminiReason, s.aiName),
               );
               final col = r.$3 == 'CALL' ? C.green : (r.$3 == 'PUT' ? C.red : C.amber);
               return Panel(
@@ -2736,7 +2897,7 @@ jobs:
                       children: [
                         const Icon(Icons.auto_awesome_rounded, color: C.blue, size: 20),
                         const SizedBox(width: 8),
-                        const Text('تحليل Gemini', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        Text(r.$6.isEmpty ? 'تحليل الذكاء الاصطناعي' : 'تحليل ${r.$6}', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
                         const Spacer(),
                         if (r.$3.isNotEmpty) _Tag('${r.$3} ${r.$4}%', col),
                       ],
@@ -2754,7 +2915,7 @@ jobs:
                         icon: r.$2
                             ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                             : const Icon(Icons.psychology_alt_rounded, size: 20),
-                        label: Text(r.$1 ? (r.$2 ? 'جارٍ التحليل…' : 'اسأل Gemini الآن') : 'أضف مفتاح Gemini من الإعدادات'),
+                        label: Text(r.$1 ? (r.$2 ? 'جارٍ التحليل…' : 'اسأل الذكاء الاصطناعي الآن') : 'أضف مفتاح API من الإعدادات'),
                       ),
                     ),
                   ],
@@ -2876,7 +3037,7 @@ jobs:
             final _sl = TextEditingController(text: '25');
             final _diff = TextEditingController(text: '250');
             final _gKey = TextEditingController();
-            final _gModel = TextEditingController(text: 'gemini-2.5-flash');
+            final _gModel = TextEditingController(text: 'auto');
             bool _gGate = false;
 
             String _asset = 'AUTO_CHART';
@@ -2980,11 +3141,11 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              final hasKey = context.select<QuotexService, bool>((s) => s.hasGeminiKey);
+              final ai = context.select<QuotexService, (bool, String, bool)>((s) => (s.hasGeminiKey, s.aiName, s.aiDetecting));
               return ListView(
                 padding: const EdgeInsets.fromLTRB(14, 6, 14, 24),
                 children: [
-                  _geminiPanel(hasKey),
+                  _geminiPanel(ai.$1, ai.$2, ai.$3),
                   const SizedBox(height: 12),
                   _collectorPanel(),
                   const SizedBox(height: 12),
@@ -3102,7 +3263,7 @@ jobs:
               );
             }
 
-            Widget _geminiPanel(bool hasKey) {
+            Widget _geminiPanel(bool hasKey, String aiName, bool detecting) {
               return Panel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -3111,22 +3272,22 @@ jobs:
                       children: [
                         const Icon(Icons.auto_awesome_rounded, color: C.blue, size: 20),
                         const SizedBox(width: 8),
-                        const Text('Gemini', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        const Text('الذكاء الاصطناعي', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
                         const Spacer(),
-                        _Tag(hasKey ? 'المفتاح مضمّن' : 'بدون مفتاح', hasKey ? C.green : C.amber),
+                        _Tag(detecting ? 'جارٍ التعرف…' : (hasKey ? (aiName.isEmpty ? 'غير معروف' : aiName) : 'بدون مفتاح'), (hasKey && aiName.isNotEmpty) ? C.green : C.amber),
                       ],
                     ),
                     const SizedBox(height: 12),
                     TextField(
                       controller: _gKey,
                       obscureText: true,
-                      decoration: _deco(hasKey ? 'مفتاح جديد (اتركه فارغاً للإبقاء على الحالي)' : 'مفتاح API'),
+                      decoration: _deco(hasKey ? 'مفتاح جديد (اتركه فارغاً للإبقاء على الحالي)' : 'ألصق مفتاح API من أي مزوّد'),
                     ),
                     const SizedBox(height: 10),
-                    TextField(controller: _gModel, decoration: _deco('اسم النموذج')),
+                    TextField(controller: _gModel, decoration: _deco('النموذج (auto = اختيار تلقائي)')),
                     SwitchListTile(
                       contentPadding: EdgeInsets.zero,
-                      title: const Text('اشترط موافقة Gemini قبل كل صفقة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                      title: const Text('اشترط موافقة الذكاء الاصطناعي قبل كل صفقة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
                       subtitle: const Text('يضيف ثواني من الانتظار قبل التنفيذ', style: TextStyle(color: C.dim, fontSize: 12)),
                       value: _gGate,
                       onChanged: (v) => setState(() => _gGate = v),
@@ -3134,13 +3295,13 @@ jobs:
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton(
-                        onPressed: () {
+                        onPressed: detecting ? null : () {
                           final k = _gKey.text.trim();
                           context.read<QuotexService>().setGemini(key: k.isEmpty ? null : k, model: _gModel.text.trim(), gate: _gGate);
                           _gKey.clear();
                           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('تم الحفظ على هذا الجهاز')));
                         },
-                        child: const Text('حفظ'),
+                        child: Text(detecting ? 'جارٍ التعرف…' : 'حفظ والتعرف على المزوّد'),
                       ),
                     ),
                   ],
