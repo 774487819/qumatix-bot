@@ -333,6 +333,21 @@ jobs:
             String _geminiKey = _defaultGeminiKey;
             String _aiProv = '';
             String _aiName = '';
+            String _lastTradeDir = '';
+            String _lastTradeAsset = '';
+            double _lastTradeEntry = 0.0;
+            int _lossStreak = 0;
+            String _aiAlert = '';
+            String _aiLossNote = '';
+            String _aiSummary = '';
+            bool _aiSummaryBusy = false;
+            bool _aiAuto = false;
+            int _aiMinConf = 80;
+            int _aiEvery = 30;
+            int _aiFailStreak = 0;
+            int _geminiAt = 0;
+            final List<List<dynamic>> _aiPending = [];
+            int _aiHits = 0, _aiTotal = 0, _aiHitsHi = 0, _aiTotalHi = 0;
             String _probeNotes = '';
             bool _aiDetecting = false;
             bool _modelManual = false;
@@ -517,6 +532,16 @@ jobs:
               _aiProv = p.getString('ai_prov') ?? '';
               _aiName = p.getString('ai_name') ?? '';
               _modelManual = p.getBool('ai_manual') ?? false;
+              _aiAuto = p.getBool('ai_auto') ?? false;
+              _aiMinConf = p.getInt('ai_minconf') ?? 80;
+              _aiEvery = p.getInt('ai_every') ?? 30;
+              final st = p.getStringList('ai_stats');
+              if (st != null && st.length == 4) {
+                _aiHits = int.tryParse(st[0]) ?? 0;
+                _aiTotal = int.tryParse(st[1]) ?? 0;
+                _aiHitsHi = int.tryParse(st[2]) ?? 0;
+                _aiTotalHi = int.tryParse(st[3]) ?? 0;
+              }
                 _collectEnabled = p.getBool('collect_otc') ?? false;
               } catch (_) {}
               try {
@@ -826,7 +851,8 @@ jobs:
               }
               if (key != null && key.isNotEmpty) {
                 _geminiKey = key;
-                _aiProv = '';
+              _aiFailStreak = 0;
+              _aiProv = '';
                 _aiName = '';
               }
               await _saveAiPrefs();
@@ -844,27 +870,130 @@ jobs:
               bool get geminiGate => _geminiGate;
               String get geminiModel => _geminiModel;
 
-              Future<void> askGemini() async {
-              if (_geminiKey.isEmpty || _geminiBusy) return;
-              _geminiBusy = true;
+              bool get aiAuto => _aiAuto;
+            int get aiMinConf => _aiMinConf;
+            int get aiEvery => _aiEvery;
+            String get aiAlert => _aiAlert;
+            String get aiLossNote => _aiLossNote;
+            String get aiSummary => _aiSummary;
+            bool get aiSummaryBusy => _aiSummaryBusy;
+            bool get aiSignalOk => (_geminiDir == 'CALL' || _geminiDir == 'PUT') && _geminiConf >= _aiMinConf;
+            String get aiStatsText {
+              if (_aiTotal == 0) return 'دقة توقعات الذكاء الاصطناعي المقاسة: لا توجد بيانات بعد';
+              final all = (_aiHits * 100 / _aiTotal).toStringAsFixed(0);
+              final hi = _aiTotalHi == 0 ? '—' : '${(_aiHitsHi * 100 / _aiTotalHi).toStringAsFixed(0)}%';
+              return 'الدقة المقاسة: $all% من $_aiTotal توقعاً • عند ثقة $_aiMinConf% فأكثر: $hi من $_aiTotalHi';
+            }
+
+            Future<void> _saveAiOpts() async {
+              try {
+                final p = await SharedPreferences.getInstance();
+                await p.setBool('ai_auto', _aiAuto);
+                await p.setInt('ai_minconf', _aiMinConf);
+                await p.setInt('ai_every', _aiEvery);
+              } catch (_) {}
+            }
+
+            Future<void> _saveAiStats() async {
+              try {
+                final p = await SharedPreferences.getInstance();
+                await p.setStringList('ai_stats', ['$_aiHits', '$_aiTotal', '$_aiHitsHi', '$_aiTotalHi']);
+              } catch (_) {}
+            }
+
+            Future<void> setAiAuto(bool v) async {
+              _aiAuto = v;
+              _aiFailStreak = 0;
+              await _saveAiOpts();
+              addLog(v ? "تشغيل تحليل الذكاء الاصطناعي المستمر (كل $_aiEvery ثانية)" : "إيقاف تحليل الذكاء الاصطناعي المستمر");
+            }
+
+            Future<void> setAiMinConf(int v) async {
+              _aiMinConf = v;
+              await _saveAiOpts();
+              notifyListeners();
+            }
+
+            Future<void> setAiEvery(int v) async {
+              _aiEvery = v;
+              await _saveAiOpts();
+              notifyListeners();
+            }
+
+            void _evalAiPredictions() {
+              if (_aiPending.isEmpty) return;
+              final now = DateTime.now().millisecondsSinceEpoch;
+              bool changed = false;
+              _aiPending.removeWhere((p) {
+                if (now - (p[0] as int) < _tradeDuration * 1000) return false;
+                final entry = p[1] as double;
+                final dir = p[2] as String;
+                final conf = p[3] as int;
+                if (_lastPrice != entry && _lastPrice > 0) {
+                  final hit = (dir == 'CALL' && _lastPrice > entry) || (dir == 'PUT' && _lastPrice < entry);
+                  _aiTotal++;
+                  if (hit) _aiHits++;
+                  if (conf >= _aiMinConf) {
+                    _aiTotalHi++;
+                    if (hit) _aiHitsHi++;
+                  }
+                  changed = true;
+                }
+                return true;
+              });
+              if (changed) {
+                _saveAiStats();
+                notifyListeners();
+              }
+            }
+
+            void _onLossAi(double amt) {
+              if (_lossStreak >= 3) {
+                _aiAlert = "⚠️ $_lossStreak خسائر متتالية: فكّر في إيقاف البوت أو تقليل المبلغ";
+                addLog(_aiAlert);
+              }
+              if (_aiAuto && _geminiKey.isNotEmpty) _explainLoss(amt);
+            }
+
+            Future<void> _explainLoss(double amt) async {
+              final recent = _priceHistory.length > 20 ? _priceHistory.sublist(_priceHistory.length - 20) : _priceHistory;
+              final prompt = 'A binary-option trade just lost. In at most 2 short Arabic sentences explain the most likely reason '
+                  'and one thing to avoid next time. Data: direction=$_lastTradeDir, asset=$_lastTradeAsset, entryPrice=$_lastTradeEntry, '
+                  'exitPrice=$_lastPrice, lossAmount=$amt, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
+                  'crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, aiOpinion=$_geminiDir $_geminiConf%, '
+                  'last20Prices=${recent.join(",")}';
+              final t = await _aiText(prompt, json: false);
+              if (t != null && t.trim().isNotEmpty) {
+                _aiLossNote = t.trim();
+                addLog("🧠 سبب الخسارة المحتمل: $_aiLossNote");
+              }
+            }
+
+            Future<void> aiSessionSummary() async {
+              if (_geminiKey.isEmpty || _aiSummaryBusy) return;
+              _aiSummaryBusy = true;
               notifyListeners();
               try {
-                if (_aiProv.isEmpty && !await _detectAi()) {
-                  _geminiDir = '';
-                  return;
-                }
-                final recent = _priceHistory.length > 30 ? _priceHistory.sublist(_priceHistory.length - 30) : _priceHistory;
-                final prompt = 'You are a cautious market analyst for a 1-minute binary option. Use ONLY the data below. '
-                    'Reply with strict JSON only: {"direction":"CALL|PUT|WAIT","confidence":0-100,"reason":"one short Arabic sentence"}. '
-                    'Answer WAIT when the data is unclear. Data: asset=$activeAsset, lastPrice=$_lastPrice, '
-                    'ema5=${_ema5.toStringAsFixed(6)}, ema13=${_ema13.toStringAsFixed(6)}, rsi14=${_currentRsi.toStringAsFixed(1)}, '
-                    'macdHist=${_macdHistogram.toStringAsFixed(6)}, stochK=${_stochasticK.toStringAsFixed(1)}, cci=${_cci14.toStringAsFixed(1)}, '
-                    'momentum=${_priceMomentum.toStringAsFixed(6)}, crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, '
-                    'trainedModelProbUp=${_modelProb?.toStringAsFixed(3) ?? "n/a"}, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
-                    'last30Prices=${recent.join(",")}';
-                final base = _providers.firstWhere((p) => p['id'] == _aiProv)['base']!;
-                (int, String) r = (0, '');
-                String text = '';
+                final lines = _logs.take(30).toList();
+                final prompt = 'Summarize this binary-options trading session in Arabic as at most 5 short bullet lines: '
+                    'what worked, what failed, and one concrete recommendation. '
+                    'Stats: trades=$_totalTrades wins=$_wonTrades losses=$_lostTrades netProfit=${netProfit.toStringAsFixed(2)}, '
+                    'martingale=$_useMartingale, $aiStatsText. Recent log lines (newest first): ${lines.join(" | ")}';
+                final t = await _aiText(prompt, json: false);
+                if (t != null && t.trim().isNotEmpty) _aiSummary = t.trim();
+              } finally {
+                _aiSummaryBusy = false;
+                notifyListeners();
+              }
+            }
+
+            Future<String?> _aiText(String prompt, {required bool json}) async {
+              if (_geminiKey.isEmpty) return null;
+              if (_aiProv.isEmpty && !await _detectAi()) return null;
+              final base = _providers.firstWhere((p) => p['id'] == _aiProv)['base']!;
+              (int, String) r = (0, '');
+              String text = '';
+              try {
                 if (_aiProv == 'gemini' || _aiProv == 'vertex') {
                   final url = _aiProv == 'vertex'
                       ? '$base/publishers/google/models/$_geminiModel:generateContent?key=$_geminiKey'
@@ -874,52 +1003,86 @@ jobs:
                         'contents': [
                           {'role': 'user', 'parts': [{'text': prompt}]}
                         ],
-                        'generationConfig': {'temperature': 0.2, 'responseMimeType': 'application/json'},
+                        'generationConfig': {'temperature': 0.2, if (json) 'responseMimeType': 'application/json'},
                       }));
                   if (r.$1 == 200) text = jsonDecode(r.$2)['candidates'][0]['content']['parts'][0]['text'] as String;
                 } else if (_aiProv == 'anthropic') {
                   r = await _httpCall('POST', '$base/messages', {'Content-Type': 'application/json', ..._aiHeaders('anthropic', _geminiKey)},
-                      jsonEncode({'model': _geminiModel, 'max_tokens': 400, 'messages': [{'role': 'user', 'content': prompt}]}));
+                      jsonEncode({'model': _geminiModel, 'max_tokens': 500, 'messages': [{'role': 'user', 'content': prompt}]}));
                   if (r.$1 == 200) text = jsonDecode(r.$2)['content'][0]['text'] as String;
                 } else {
                   r = await _httpCall('POST', '$base/chat/completions', {'Content-Type': 'application/json', ..._aiHeaders(_aiProv, _geminiKey)},
                       jsonEncode({'model': _geminiModel, 'temperature': 0.2, 'messages': [{'role': 'user', 'content': prompt}]}));
                   if (r.$1 == 200) text = jsonDecode(r.$2)['choices'][0]['message']['content'] as String;
                 }
-                if (r.$1 != 200) {
-                  String detail = '';
-                  try {
-                    detail = (jsonDecode(r.$2)['error']['message'] ?? '').toString();
-                  } catch (_) {}
-                  if (detail.length > 140) detail = detail.substring(0, 140);
-                  addLog("$_aiName: رفض الطلب (رمز ${r.$1}) $detail");
-                  _geminiDir = '';
-                } else {
-                  final jsonText = RegExp(r'\{[\s\S]*\}').firstMatch(text)?.group(0) ?? text;
-                  final m = jsonDecode(jsonText);
-                  final d = (m['direction'] ?? '').toString().toUpperCase();
-                  _geminiDir = (d == 'CALL' || d == 'PUT') ? d : 'WAIT';
-                  _geminiConf = ((m['confidence'] as num?) ?? 0).round().clamp(0, 100);
-                  _geminiReason = (m['reason'] ?? '').toString();
-                }
               } catch (_) {
                 addLog("الذكاء الاصطناعي: تعذر الاتصال أو قراءة الرد");
+                return null;
+              }
+              if (r.$1 != 200) {
+                String detail = '';
+                try {
+                  detail = (jsonDecode(r.$2)['error']['message'] ?? '').toString();
+                } catch (_) {}
+                if (detail.length > 140) detail = detail.substring(0, 140);
+                addLog("$_aiName: رفض الطلب (رمز ${r.$1}) $detail");
+                return null;
+              }
+              return text;
+            }
+
+            Future<void> askGemini() async {
+              if (_geminiKey.isEmpty || _geminiBusy) return;
+              _geminiBusy = true;
+              notifyListeners();
+              try {
+                final recent = _priceHistory.length > 30 ? _priceHistory.sublist(_priceHistory.length - 30) : _priceHistory;
+                final prompt = 'You are a cautious market analyst for a 1-minute binary option. Use ONLY the data below. '
+                    'Reply with strict JSON only: {"direction":"CALL|PUT|WAIT","confidence":0-100,"reason":"one short Arabic sentence"}. '
+                    'Give an honest confidence. Answer WAIT when the data is unclear. Data: asset=$activeAsset, lastPrice=$_lastPrice, '
+                    'ema5=${_ema5.toStringAsFixed(6)}, ema13=${_ema13.toStringAsFixed(6)}, rsi14=${_currentRsi.toStringAsFixed(1)}, '
+                    'macdHist=${_macdHistogram.toStringAsFixed(6)}, stochK=${_stochasticK.toStringAsFixed(1)}, cci=${_cci14.toStringAsFixed(1)}, '
+                    'momentum=${_priceMomentum.toStringAsFixed(6)}, crowdCallVolume=$_crowdCallVolume, crowdPutVolume=$_crowdPutVolume, '
+                    'trainedModelProbUp=${_modelProb?.toStringAsFixed(3) ?? "n/a"}, indicatorSignal=$_currentSignalDirection $_currentSignalStrength%, '
+                    'last30Prices=${recent.join(",")}';
+                final text = await _aiText(prompt, json: true);
+                if (text == null) {
+                  _geminiDir = '';
+                  _aiFailStreak++;
+                  return;
+                }
+                final jsonText = RegExp(r'\{[\s\S]*\}').firstMatch(text)?.group(0) ?? text;
+                final m = jsonDecode(jsonText);
+                final d = (m['direction'] ?? '').toString().toUpperCase();
+                _geminiDir = (d == 'CALL' || d == 'PUT') ? d : 'WAIT';
+                _geminiConf = ((m['confidence'] as num?) ?? 0).round().clamp(0, 100);
+                _geminiReason = (m['reason'] ?? '').toString();
+                _geminiAt = DateTime.now().millisecondsSinceEpoch;
+                _aiFailStreak = 0;
+                if ((_geminiDir == 'CALL' || _geminiDir == 'PUT') && _lastPrice > 0) {
+                  _aiPending.add([_geminiAt, _lastPrice, _geminiDir, _geminiConf]);
+                  if (_aiPending.length > 200) _aiPending.removeAt(0);
+                }
+              } catch (_) {
+                addLog("الذكاء الاصطناعي: تعذر قراءة الرد");
                 _geminiDir = '';
+                _aiFailStreak++;
               } finally {
                 _geminiBusy = false;
                 notifyListeners();
               }
             }
 
-              Future<bool> _geminiApproves(String dir) async {
-                if (!_geminiGate || _geminiKey.isEmpty) return true;
-                await askGemini();
-                final ok = _geminiDir == dir.toUpperCase() && _geminiConf >= 60;
-                addLog(ok
-                    ? "الذكاء الاصطناعي وافق على ${dir.toUpperCase()} ($_geminiConf%)"
-                    : "الذكاء الاصطناعي لم يوافق (${_geminiDir.isEmpty ? 'لا رد' : _geminiDir} $_geminiConf%) وتم تخطي هذه الدقيقة");
-                return ok;
-              }            bool get isConnected => _isConnected;
+            Future<bool> _geminiApproves(String dir) async {
+              if (!_geminiGate || _geminiKey.isEmpty) return true;
+              final fresh = _geminiDir.isNotEmpty && DateTime.now().millisecondsSinceEpoch - _geminiAt < 45000;
+              if (!fresh) await askGemini();
+              final ok = _geminiDir == dir.toUpperCase() && _geminiConf >= _aiMinConf;
+              addLog(ok
+                  ? "الذكاء الاصطناعي وافق على ${dir.toUpperCase()} ($_geminiConf%)"
+                  : "الذكاء الاصطناعي لم يوافق (${_geminiDir.isEmpty ? 'لا رد' : _geminiDir} $_geminiConf% والحد $_aiMinConf%) وتم تخطي هذه الدقيقة");
+              return ok;
+            }            bool get isConnected => _isConnected;
             bool get isAuthenticated => _isAuthenticated;
             bool get isAutoTrading => _isAutoTrading;
             bool get isTradeOpen => _isTradeOpen;
@@ -1172,6 +1335,15 @@ jobs:
               _webSyncTimer = Timer.periodic(const Duration(milliseconds: 800), (_) async {
                 if (!_isConnected || _webViewController == null) return;
                 tickCounter++;
+                if (_aiAuto && _geminiKey.isNotEmpty && !_geminiBusy && _aiFailStreak < 3 && _isConnected && _priceHistory.length >= 30 &&
+                    tickCounter % ((_aiEvery * 1000 / 800).round()) == 0) {
+                  askGemini();
+                }
+                if (_aiFailStreak == 3) {
+                  _aiFailStreak = 4;
+                  addLog("تم إيقاف التحليل المستمر مؤقتاً بعد 3 فشل متتالي، راجع المفتاح ثم احفظه من جديد");
+                }
+                _evalAiPredictions();
                 final bool collectIdle = _collectEnabled && !_isAutoTrading && !_isTradeOpen;
                 if (collectIdle && (_collectBurstPending || tickCounter % 375 == 0) && !_bursting) {
                   _collectBurstPending = false;
@@ -1870,6 +2042,9 @@ jobs:
                 return;
               }
 
+              _lastTradeDir = direction.toUpperCase();
+              _lastTradeAsset = targetPair;
+              _lastTradeEntry = _lastPrice;
               _isTradeOpen = true;
               _remainingSeconds = duration;
               _activeTradeEntryPrice = entryPriceBeforeOrder;
@@ -1904,6 +2079,7 @@ jobs:
               if (beforeBal > 0 && currentBal > 0) {
                 if (diff > 0.05) {
                   _wonTrades++;
+                  _lossStreak = 0;
                   _currentTradeAmount = _baseAmount;
                   for (int i = 0; i < _deepNeuralWeights.length; i++) {
                     _deepNeuralWeights[i] = (_deepNeuralWeights[i] * 1.03).clamp(0.08, 0.50);
@@ -1911,6 +2087,8 @@ jobs:
                   addLog("✔ صفقة رابحة مؤكدة (+ \$${diff.toStringAsFixed(2)}) | الرصيد الجديد: \$${currentBal.toStringAsFixed(2)} | العودة للمبلغ الأساسي: \$$_baseAmount");
                 } else if (diff < -0.05) {
                   _lostTrades++;
+                  _lossStreak++;
+                  _onLossAi(diff.abs());
                   for (int i = 0; i < _deepNeuralWeights.length; i++) {
                     _deepNeuralWeights[i] = (_deepNeuralWeights[i] * 0.97).clamp(0.08, 0.50);
                   }
@@ -2904,10 +3082,11 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              final r = context.select<QuotexService, (bool, bool, String, int, String, String)>(
-                (s) => (s.hasGeminiKey, s.geminiBusy, s.geminiDir, s.geminiConf, s.geminiReason, s.aiName),
+              final r = context.select<QuotexService, (bool, bool, String, int, String, String, bool, String, String, String, String, bool, bool)>(
+                (s) => (s.hasGeminiKey, s.geminiBusy, s.geminiDir, s.geminiConf, s.geminiReason, s.aiName, s.aiAuto, s.aiStatsText, s.aiAlert, s.aiLossNote, s.aiSummary, s.aiSummaryBusy, s.aiSignalOk),
               );
-              final col = r.$3 == 'CALL' ? C.green : (r.$3 == 'PUT' ? C.red : C.amber);
+              final col = !r.$13 ? C.dim : (r.$3 == 'CALL' ? C.green : C.red);
+              final svc = context.read<QuotexService>();
               return Panel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -2916,7 +3095,9 @@ jobs:
                       children: [
                         const Icon(Icons.auto_awesome_rounded, color: C.blue, size: 20),
                         const SizedBox(width: 8),
-                        Text(r.$6.isEmpty ? 'تحليل الذكاء الاصطناعي' : 'تحليل ${r.$6}', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        Text(r.$6.isEmpty ? 'الذكاء الاصطناعي' : r.$6, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        const SizedBox(width: 8),
+                        if (r.$7) const _Tag('مستمر', C.green),
                         const Spacer(),
                         if (r.$3.isNotEmpty) _Tag('${r.$3} ${r.$4}%', col),
                       ],
@@ -2926,16 +3107,47 @@ jobs:
                         padding: const EdgeInsets.only(top: 10),
                         child: Text(r.$5, style: const TextStyle(color: C.dim, fontSize: 12.5, height: 1.5)),
                       ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton.icon(
-                        onPressed: (r.$1 && !r.$2) ? () => context.read<QuotexService>().askGemini() : null,
-                        icon: r.$2
-                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.psychology_alt_rounded, size: 20),
-                        label: Text(r.$1 ? (r.$2 ? 'جارٍ التحليل…' : 'اسأل الذكاء الاصطناعي الآن') : 'أضف مفتاح API من الإعدادات'),
+                    if (r.$3.isNotEmpty && !r.$13)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 6),
+                        child: Text('الثقة أقل من الحد المطلوب، لن يُعتمد هذا التوقع', style: TextStyle(color: C.amber, fontSize: 11.5)),
                       ),
+                    const SizedBox(height: 8),
+                    Text(r.$8, style: const TextStyle(color: C.dim, fontSize: 11.5, height: 1.5)),
+                    if (r.$9.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(r.$9, style: const TextStyle(color: C.amber, fontSize: 12.5, fontWeight: FontWeight.w700)),
+                      ),
+                    if (r.$10.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text('سبب آخر خسارة: ${r.$10}', style: const TextStyle(color: C.dim, fontSize: 12.5, height: 1.5)),
+                      ),
+                    if (r.$11.isNotEmpty)
+                      Container(
+                        margin: const EdgeInsets.only(top: 10),
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(color: C.field, borderRadius: BorderRadius.circular(12), border: Border.all(color: C.line)),
+                        child: Text(r.$11, style: const TextStyle(fontSize: 12.5, height: 1.6)),
+                      ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: (r.$1 && !r.$2) ? () => svc.askGemini() : null,
+                            child: Text(r.$1 ? (r.$2 ? 'جارٍ التحليل…' : 'اسأل الآن') : 'أضف مفتاح API'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: (r.$1 && !r.$12) ? () => svc.aiSessionSummary() : null,
+                            child: Text(r.$12 ? 'جارٍ التلخيص…' : 'ملخص الجلسة'),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -3057,7 +3269,6 @@ jobs:
             final _diff = TextEditingController(text: '250');
             final _gKey = TextEditingController();
             final _gModel = TextEditingController(text: 'auto');
-            bool _gGate = false;
 
             String _asset = 'AUTO_CHART';
             String _strategy = 'platform_interest_contrarian';
@@ -3160,11 +3371,13 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              final ai = context.select<QuotexService, (bool, String, bool)>((s) => (s.hasGeminiKey, s.aiName, s.aiDetecting));
+              final ai = context.select<QuotexService, (bool, String, bool, bool, bool, int, int)>(
+                (s) => (s.hasGeminiKey, s.aiName, s.aiDetecting, s.geminiGate, s.aiAuto, s.aiMinConf, s.aiEvery),
+              );
               return ListView(
                 padding: const EdgeInsets.fromLTRB(14, 6, 14, 24),
                 children: [
-                  _geminiPanel(ai.$1, ai.$2, ai.$3),
+                  _geminiPanel(ai),
                   const SizedBox(height: 12),
                   _collectorPanel(),
                   const SizedBox(height: 12),
@@ -3282,7 +3495,10 @@ jobs:
               );
             }
 
-            Widget _geminiPanel(bool hasKey, String aiName, bool detecting) {
+            Widget _geminiPanel((bool, String, bool, bool, bool, int, int) ai) {
+              final hasKey = ai.$1;
+              final detecting = ai.$3;
+              final svc = context.read<QuotexService>();
               return Panel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -3293,7 +3509,7 @@ jobs:
                         const SizedBox(width: 8),
                         const Text('الذكاء الاصطناعي', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
                         const Spacer(),
-                        _Tag(detecting ? 'جارٍ التعرف…' : (hasKey ? (aiName.isEmpty ? 'غير معروف' : aiName) : 'بدون مفتاح'), (hasKey && aiName.isNotEmpty) ? C.green : C.amber),
+                        _Tag(detecting ? 'جارٍ التعرف…' : (hasKey ? (ai.$2.isEmpty ? 'غير معروف' : ai.$2) : 'بدون مفتاح'), (hasKey && ai.$2.isNotEmpty) ? C.green : C.amber),
                       ],
                     ),
                     const SizedBox(height: 12),
@@ -3304,25 +3520,48 @@ jobs:
                     ),
                     const SizedBox(height: 10),
                     TextField(controller: _gModel, decoration: _deco('النموذج (auto = اختيار تلقائي)')),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('اشترط موافقة الذكاء الاصطناعي قبل كل صفقة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
-                      subtitle: const Text('يضيف ثواني من الانتظار قبل التنفيذ', style: TextStyle(color: C.dim, fontSize: 12)),
-                      value: _gGate,
-                      onChanged: (v) => setState(() => _gGate = v),
-                    ),
+                    const SizedBox(height: 10),
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton(
-                        onPressed: detecting ? null : () {
-                          final k = _gKey.text.trim();
-                          context.read<QuotexService>().setGemini(key: k.isEmpty ? null : k, model: _gModel.text.trim(), gate: _gGate);
-                          _gKey.clear();
-                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('تم الحفظ على هذا الجهاز')));
-                        },
+                        onPressed: detecting
+                            ? null
+                            : () {
+                                final k = _gKey.text.trim();
+                                svc.setGemini(key: k.isEmpty ? null : k, model: _gModel.text.trim());
+                                _gKey.clear();
+                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('تم الحفظ على هذا الجهاز')));
+                              },
                         child: Text(detecting ? 'جارٍ التعرف…' : 'حفظ والتعرف على المزوّد'),
                       ),
                     ),
+                    const SizedBox(height: 6),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('تحليل مستمر طوال الوقت', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                      subtitle: const Text('يحلل السوق تلقائياً ويشرح الخسائر وينبّهك عند تكرارها', style: TextStyle(color: C.dim, fontSize: 12)),
+                      value: ai.$5,
+                      onChanged: hasKey ? (v) => svc.setAiAuto(v) : null,
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('اشترط موافقة الذكاء الاصطناعي قبل كل صفقة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                      subtitle: const Text('لا تُنفَّذ الصفقة إلا إذا وافق بثقة لا تقل عن الحد', style: TextStyle(color: C.dim, fontSize: 12)),
+                      value: ai.$4,
+                      onChanged: hasKey ? (v) => svc.setGemini(gate: v) : null,
+                    ),
+                    const SizedBox(height: 6),
+                    const Text('أدنى ثقة مطلوبة', style: TextStyle(color: C.dim, fontSize: 12)),
+                    const SizedBox(height: 8),
+                    Wrap(spacing: 8, runSpacing: 8, children: [
+                      for (final p in [60, 70, 80, 90]) _chip('$p%', ai.$6 == p, C.green, () => svc.setAiMinConf(p)),
+                    ]),
+                    const SizedBox(height: 10),
+                    const Text('تكرار التحليل المستمر', style: TextStyle(color: C.dim, fontSize: 12)),
+                    const SizedBox(height: 8),
+                    Wrap(spacing: 8, runSpacing: 8, children: [
+                      for (final e in {15: '15ث', 30: '30ث', 60: 'دقيقة'}.entries) _chip(e.value, ai.$7 == e.key, C.blue, () => svc.setAiEvery(e.key)),
+                    ]),
                   ],
                 ),
               );
